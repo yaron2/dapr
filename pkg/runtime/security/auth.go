@@ -113,6 +113,8 @@ func (a *authenticator) CreateSignedWorkloadCert(id string) (*SignedCertificate,
 		CertificateSigningRequest: certPem,
 		Id:                        getSentryIdentifier(id),
 		Token:                     getToken(),
+		TrustDomain:               "public",
+		Namespace:                 "default",
 	}, grpc_retry.WithMax(sentryMaxRetries), grpc_retry.WithPerRetryTimeout(sentrySignTimeout))
 	if err != nil {
 		diag.DefaultMonitoring.MTLSWorkLoadCertRotationFailed("sign")
