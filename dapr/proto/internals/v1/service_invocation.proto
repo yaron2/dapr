@@ -10,6 +10,8 @@ package dapr.proto.internals.v1;
 import "dapr/proto/common/v1/common.proto";
 import "dapr/proto/internals/v1/apiversion.proto";
 import "dapr/proto/internals/v1/status.proto";
+import "google/protobuf/any.proto";
+import "google/protobuf/empty.proto";
 
 option go_package = "github.com/dapr/dapr/pkg/proto/internals/v1;internals";
 
@@ -29,6 +31,8 @@ service ServiceInvocation {
 
   // Invokes a method of the specific service.
   rpc CallLocal (InternalInvokeRequest) returns (InternalInvokeResponse) {}
+
+  rpc RegisterActorTimer(InternalRegisterActorTimerRequest) returns (google.protobuf.Empty) {}
 }
 
 // Actor represents actor using actor_type and actor_id
@@ -38,6 +42,20 @@ message Actor {
 
   // Required. The ID of actor type (actor_type)
   string actor_id = 2;
+}
+
+message InternalRegisterActorTimerRequest {
+  string actor_type = 1;
+  string actor_id = 2;
+  string name = 3;
+  string due_time = 4;
+  string period = 5;
+  string callback = 6;
+  google.protobuf.Any data = 7;
+}
+
+message InternalRegisterActorTimerResponse {
+
 }
 
 // InternalInvokeRequest is the message to transfer caller's data to callee

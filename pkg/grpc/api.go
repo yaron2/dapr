@@ -33,6 +33,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/emptypb"
 )
 
 const (
@@ -56,6 +57,7 @@ type API interface {
 	SaveState(ctx context.Context, in *runtimev1pb.SaveStateRequest) (*empty.Empty, error)
 	DeleteState(ctx context.Context, in *runtimev1pb.DeleteStateRequest) (*empty.Empty, error)
 	ExecuteStateTransaction(ctx context.Context, in *runtimev1pb.ExecuteStateTransactionRequest) (*empty.Empty, error)
+	RegisterActorTimer(ctx context.Context, in *internalv1pb.InternalRegisterActorTimerRequest) (*empty.Empty, error)
 }
 
 type api struct {
@@ -435,6 +437,23 @@ func (a *api) getModifiedStateKey(key string) string {
 		return fmt.Sprintf("%s%s%s", a.id, daprSeparator, key)
 	}
 	return key
+}
+
+func (a *api) RegisterActorTimer(ctx context.Context, in *internalv1pb.InternalRegisterActorTimerRequest) (*empty.Empty, error) {
+	req := &actors.CreateTimerRequest{
+		Name:      in.Name,
+		ActorID:   in.ActorId,
+		ActorType: in.ActorType,
+		DueTime:   in.DueTime,
+		Period:    in.Period,
+		Callback:  in.Callback,
+	}
+
+	if in.Data != nil {
+		req.Data = string(in.Data.Value)
+	}
+	err := a.actor.CreateTimer(ctx, req)
+	return &emptypb.Empty{}, err
 }
 
 func (a *api) GetSecret(ctx context.Context, in *runtimev1pb.GetSecretRequest) (*runtimev1pb.GetSecretResponse, error) {
