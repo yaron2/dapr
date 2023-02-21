@@ -11,15 +11,15 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+//nolint:forbidigo,nosnakecase
 package placement
 
 import (
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
-
-	"go.uber.org/atomic"
 
 	"github.com/stretchr/testify/assert"
 	"google.golang.org/grpc"
@@ -294,6 +294,7 @@ func PerformTableUpdateCostTime() (wastedTime int64) {
 	const testClients = 100
 	serverAddress, testServer, cleanup := newTestPlacementServer(testRaftServer)
 	testServer.hasLeadership.Store(true)
+	overArrLock := sync.Mutex{}
 	var overArr [testClients]int64
 	// arrange.
 	var clientConns []*grpc.ClientConn
@@ -331,7 +332,9 @@ func PerformTableUpdateCostTime() (wastedTime int64) {
 							if clientID == 1 {
 								fmt.Println("client 1 unlock", time.Now())
 							}
+							overArrLock.Lock()
 							overArr[clientID] = time.Since(start).Milliseconds()
+							overArrLock.Unlock()
 						}
 					}
 				}
@@ -351,7 +354,10 @@ func PerformTableUpdateCostTime() (wastedTime int64) {
 	}
 	// Wait until clientStreams[clientID].Recv() in client go routine received new table.
 	for {
-		if len(testServer.streamConnPool) == testClients {
+		testServer.streamConnPoolLock.Lock()
+		l := len(testServer.streamConnPool)
+		testServer.streamConnPoolLock.Unlock()
+		if l == testClients {
 			break
 		}
 	}
@@ -377,11 +383,13 @@ func PerformTableUpdateCostTime() (wastedTime int64) {
 	startFlag.Store(false)
 	time.Sleep(time.Second) // wait client recv
 	var max int64
+	overArrLock.Lock()
 	for _, cost := range &overArr {
 		if cost > max {
 			max = cost
 		}
 	}
+	overArrLock.Unlock()
 	// clean up resources.
 	for i := 0; i < testClients; i++ {
 		clientStreams[i].CloseSend()

@@ -15,21 +15,22 @@ package messaging
 
 import (
 	"context"
+	"errors"
+	"fmt"
 
-	"github.com/pkg/errors"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 
-	grpc_proxy "github.com/dapr/dapr/pkg/grpc/proxy"
-	codec "github.com/dapr/dapr/pkg/grpc/proxy/codec"
-	"github.com/dapr/dapr/pkg/resiliency"
-
 	"github.com/dapr/dapr/pkg/acl"
 	"github.com/dapr/dapr/pkg/config"
 	"github.com/dapr/dapr/pkg/diagnostics"
+	grpcProxy "github.com/dapr/dapr/pkg/grpc/proxy"
+	codec "github.com/dapr/dapr/pkg/grpc/proxy/codec"
+	invokev1 "github.com/dapr/dapr/pkg/messaging/v1"
 	"github.com/dapr/dapr/pkg/proto/common/v1"
+	"github.com/dapr/dapr/pkg/resiliency"
 )
 
 // Proxy is the interface for a gRPC transparent proxy.
@@ -41,73 +42,104 @@ type Proxy interface {
 
 type proxy struct {
 	appID             string
+	appClientFn       func() (grpc.ClientConnInterface, error)
 	connectionFactory messageClientConnection
 	remoteAppFn       func(appID string) (remoteApp, error)
-	remotePort        int
 	telemetryFn       func(context.Context) context.Context
-	localAppAddress   string
 	acl               *config.AccessControlList
-	sslEnabled        bool
 	resiliency        resiliency.Provider
 }
 
+// ProxyOpts is the struct with options for NewProxy.
+type ProxyOpts struct {
+	AppClientFn       func() (grpc.ClientConnInterface, error)
+	ConnectionFactory messageClientConnection
+	AppID             string
+	ACL               *config.AccessControlList
+	Resiliency        resiliency.Provider
+}
+
 // NewProxy returns a new proxy.
-func NewProxy(connectionFactory messageClientConnection, appID string, localAppAddress string, remoteDaprPort int, acl *config.AccessControlList, sslEnabled bool, resiliency resiliency.Provider) Proxy {
+func NewProxy(opts ProxyOpts) Proxy {
 	return &proxy{
-		appID:             appID,
-		connectionFactory: connectionFactory,
-		localAppAddress:   localAppAddress,
-		remotePort:        remoteDaprPort,
-		acl:               acl,
-		sslEnabled:        sslEnabled,
-		resiliency:        resiliency,
+		appClientFn:       opts.AppClientFn,
+		appID:             opts.AppID,
+		connectionFactory: opts.ConnectionFactory,
+		acl:               opts.ACL,
+		resiliency:        opts.Resiliency,
 	}
 }
 
 // Handler returns a Stream Handler for handling requests that arrive for services that are not recognized by the server.
 func (p *proxy) Handler() grpc.StreamHandler {
-	return grpc_proxy.TransparentHandler(p.intercept, p.resiliency, p.IsLocal)
+	return grpcProxy.TransparentHandler(p.intercept,
+		func(appID, methodName string) *resiliency.PolicyDefinition {
+			_, isLocal, err := p.isLocal(appID)
+			if err == nil && !isLocal {
+				return p.resiliency.EndpointPolicy(appID, appID+":"+methodName)
+			}
+
+			return resiliency.NoOp{}.EndpointPolicy("", "")
+		},
+		grpcProxy.DirectorConnectionFactory(p.connectionFactory),
+	)
 }
 
-func (p *proxy) intercept(ctx context.Context, fullName string) (context.Context, *grpc.ClientConn, func(), error) {
+func nopTeardown(destroy bool) {
+	// Nop
+}
+
+func (p *proxy) intercept(ctx context.Context, fullName string) (context.Context, *grpc.ClientConn, *grpcProxy.ProxyTarget, func(destroy bool), error) {
 	md, _ := metadata.FromIncomingContext(ctx)
 
-	v := md.Get(diagnostics.GRPCProxyAppIDKey)
+	v := md[diagnostics.GRPCProxyAppIDKey]
 	if len(v) == 0 {
-		return ctx, nil, func() {}, errors.Errorf("failed to proxy request: required metadata %s not found", diagnostics.GRPCProxyAppIDKey)
+		return ctx, nil, nil, nopTeardown, fmt.Errorf("failed to proxy request: required metadata %s not found", diagnostics.GRPCProxyAppIDKey)
 	}
 
 	outCtx := metadata.NewOutgoingContext(ctx, md.Copy())
 	appID := v[0]
 
 	if p.remoteAppFn == nil {
-		return ctx, nil, func() {}, errors.Errorf("failed to proxy request: proxy not initialized. daprd startup may be incomplete")
+		return ctx, nil, nil, nopTeardown, errors.New("failed to proxy request: proxy not initialized. daprd startup may be incomplete")
 	}
 
-	target, isLocal, err := p.isLocalInternal(appID)
+	target, isLocal, err := p.isLocal(appID)
 	if err != nil {
-		return ctx, nil, func() {}, err
+		return ctx, nil, nil, nopTeardown, err
 	}
 
 	if isLocal {
 		// proxy locally to the app
 		if p.acl != nil {
-			ok, authError := acl.ApplyAccessControlPolicies(ctx, fullName, common.HTTPExtension_NONE, config.GRPCProtocol, p.acl)
+			ok, authError := acl.ApplyAccessControlPolicies(ctx, fullName, common.HTTPExtension_NONE, config.GRPCProtocol, p.acl) //nolint:nosnakecase
 			if !ok {
-				return ctx, nil, func() {}, status.Errorf(codes.PermissionDenied, authError)
+				return ctx, nil, nil, nopTeardown, status.Errorf(codes.PermissionDenied, authError)
 			}
 		}
 
-		conn, teardown, cErr := p.connectionFactory(outCtx, p.localAppAddress, p.appID, "", true, false, p.sslEnabled, grpc.WithDefaultCallOptions(grpc.CallContentSubtype((&codec.Proxy{}).Name())))
-		return outCtx, conn, teardown, cErr
+		var appClient grpc.ClientConnInterface
+		appClient, err = p.appClientFn()
+		if err != nil {
+			return ctx, nil, nil, nopTeardown, err
+		}
+		return outCtx, appClient.(*grpc.ClientConn), nil, nopTeardown, nil
 	}
 
 	// proxy to a remote daprd
-	// connection is recreated because its certification may have already been expired
-	conn, teardown, cErr := p.connectionFactory(outCtx, target.address, target.id, target.namespace, false, true, false, grpc.WithDefaultCallOptions(grpc.CallContentSubtype((&codec.Proxy{}).Name())))
+	conn, teardown, cErr := p.connectionFactory(outCtx, target.address, target.id, target.namespace,
+		grpc.WithDefaultCallOptions(grpc.CallContentSubtype((&codec.Proxy{}).Name())),
+	)
 	outCtx = p.telemetryFn(outCtx)
+	outCtx = metadata.AppendToOutgoingContext(outCtx, invokev1.CallerIDHeader, p.appID, invokev1.CalleeIDHeader, target.id)
 
-	return outCtx, conn, teardown, cErr
+	pt := &grpcProxy.ProxyTarget{
+		ID:        target.id,
+		Namespace: target.namespace,
+		Address:   target.address,
+	}
+
+	return outCtx, conn, pt, teardown, cErr
 }
 
 // SetRemoteAppFn sets a function that helps the proxy resolve an app ID to an actual address.
@@ -120,15 +152,9 @@ func (p *proxy) SetTelemetryFn(spanFn func(context.Context) context.Context) {
 	p.telemetryFn = spanFn
 }
 
-// Expose the functionality to detect if apps are local or not.
-func (p *proxy) IsLocal(appID string) (bool, error) {
-	_, isLocal, err := p.isLocalInternal(appID)
-	return isLocal, err
-}
-
-func (p *proxy) isLocalInternal(appID string) (remoteApp, bool, error) {
+func (p *proxy) isLocal(appID string) (remoteApp, bool, error) {
 	if p.remoteAppFn == nil {
-		return remoteApp{}, false, errors.Errorf("failed to proxy request: proxy not initialized. daprd startup may be incomplete")
+		return remoteApp{}, false, errors.New("failed to proxy request: proxy not initialized; daprd startup may be incomplete")
 	}
 
 	target, err := p.remoteAppFn(appID)

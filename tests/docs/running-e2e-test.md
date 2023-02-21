@@ -25,6 +25,9 @@ E2E tests are designed for verifying the functional correctness by replicating e
     export DAPR_NAMESPACE=dapr-tests
     export DAPR_MTLS_ENABLED=true
 
+    # If you want to enable debug logs for the daprd container set this
+    # export DEBUG_LOGGING=true
+
     # If you want to run tests against Windows or arm kubernetes clusters, uncomment and set these
     # export TARGET_OS=linux
     # export TARGET_ARCH=amd64
@@ -33,6 +36,10 @@ E2E tests are designed for verifying the functional correctness by replicating e
     # or vice versa) uncomment and set these
     # export GOOS=linux
     # export GOARCH=amd64
+
+    # If you want to use a single container image `dapr` instead of individual images 
+    # (like sentry, injector, daprd, etc.), uncomment and set this.
+    # export ONLY_DAPR_IMAGE=true
 
     # Do not set DAPR_TEST_ENV if you do not use minikube
     export DAPR_TEST_ENV=minikube
@@ -68,12 +75,12 @@ E2E tests are designed for verifying the functional correctness by replicating e
 
 If you are starting from scratch and just want to build dapr, deploy it, and run the e2e tests to your kubernetes cluster, do the following:
 
-1. Uninstall dapr, dapr-kafka, dapr-redis, dapr-mongodb services, if they exist
+1. Uninstall dapr, dapr-kafka, dapr-redis, dapr-mongodb, dapr-temporal services, if they exist
 
    *Make sure you have DAPR_NAMESPACE set properly before you do this!*
 
    ```sh
-   helm uninstall dapr dapr-kafka dapr-redis dapr-mongodb -n $DAPR_NAMESPACE
+   helm uninstall dapr dapr-kafka dapr-redis dapr-mongodb dapr-temporal -n $DAPR_NAMESPACE
    ```
 
 2. Remove the test namespace, if it exists
@@ -82,7 +89,7 @@ If you are starting from scratch and just want to build dapr, deploy it, and run
    make delete-test-namespace
    ```
 
-    > Note: please make sure that you have executed helm uninstall command before you deleted dapr test namespace. Otherwise if you directly deleted the dapr test namespace without helm unisntall command and re-installed dapr control plane, the dapr sidecar injector won't work and fail for "bad certificate". And you have already run into this problem, you can recover by helm uninstall command. See https://github.com/dapr/dapr/issues/4612
+    > Note: please make sure that you have executed helm uninstall command before you deleted dapr test namespace. Otherwise if you directly deleted the dapr test namespace without helm uninstall command and re-installed dapr control plane, the dapr sidecar injector won't work and fail for "bad certificate". And you have already run into this problem, you can recover by helm uninstall command. See https://github.com/dapr/dapr/issues/4612
 
 3. Build, deploy, run tests from start to finish
 
@@ -176,8 +183,13 @@ To completely remove Dapr, test dependencies, and any lingering e2e test apps:
 *Make sure you have DAPR_NAMESPACE set properly before you do this!*
 
 ```bash
-# Uninstall dapr, dapr-kafka, dapr-redis services
-helm uninstall dapr dapr-kafka dapr-redis dapr-mongodb -n $DAPR_NAMESPACE
+# Uninstall dapr, dapr-kafka, dapr-redis, dapr-mongodb, dapr-temporal services, then remove dapr-zipkin
+helm uninstall dapr -n $DAPR_NAMESPACE || true
+helm uninstall dapr-kafka  -n $DAPR_NAMESPACE || true
+helm uninstall dapr-redis  -n $DAPR_NAMESPACE || true
+helm uninstall dapr-mongodb  -n $DAPR_NAMESPACE || true
+helm uninstall dapr-temporal -n $DAPR_NAMESPACE || true
+kubectl delete deployment dapr-zipkin -n $DAPR_NAMESPACE || true
 
 # Remove the test namespace
 make delete-test-namespace
@@ -196,6 +208,58 @@ This repository's automated tests (CI) use an Azure Kubernetes Service (AKS) clu
 If you want to run the tests in a similar environment, you can deploy the test infrastructure on your own using the Bicep templates in [tests/test-infra](/tests/test-infra/).
 
 > Before you run the commands below, ensure that you have an Azure subscription, have the Azure CLI installed, and are logged into Azure (`az login`)
+
+## Run E2E tests using a Wireguard Tunnel with tailscale
+
+[Tailscale](https://tailscale.com/) is a zero-config VPN that provides NAT traversal out-of-the-box allowing our services and pods to be called directly - using its ClusterIP - without needed to be exposed using a loadbalancer.
+
+This provides a few advantages including the decrease of the total test duration.
+
+if you want to run the tests using tailscale as your network, few things are necessary:
+
+1. [Create a tailscale account](https://login.tailscale.com/), this will be necessary since we're going to use personal keys.
+2. [Download and install](https://tailscale.com/download/) the tailscale client for your OS.
+3. When you're logged in, navigate to the menu `Access Controls` and two things are necessary, edit the ACL definition with:
+   1. Create a new tag that will be used later to assign permissions to keys.
+    ```json
+    {...
+      "tagOwners": {
+        "tag:dapr-tests": ["your_email_comes_here@your_domain.com"],
+      }
+    }
+    ```
+   2. Assign permissions to the created tag. Since we are going to use the [tailscale subnet router](https://tailscale.com/kb/1185/kubernetes/), it is much convenient that the subnet router should auto approve the registered routes, for that, use the following acl.
+   ```json
+     {...
+       "autoApprovers": {
+         "routes": {
+           "10.0.0.0/8": ["tag:dapr-tests"],
+         },
+       }
+     }
+   ```
+   > Warning: as we are using `10.0.0.0/8` we must guarantee that our CIDR block used in the kubernetes cluster must be a subset of it
+4. Now, go to the Settings > Personal Settings > Keys.
+5. Once in the keys section, generate a new ephemeral key by clicking in `Generate auth key`.
+6. Mark as `reusable`, `ephemeral` and add the created tag `dapr-tests` and do not forget to copy out the value.
+
+Now, we're almost set.
+
+The next step will be install the tailscale subnet router in your kubernetes cluster, for that, run
+
+```sh
+TAILSCALE_AUTH_KEY=your_key_goes_here make setup-tailscale
+```
+
+> TIP: for security reasons you could run `unset HISTFILE` before the tailscale command so that will discard your history file
+
+Now, you have to login on tailscale client using your personal account, to verify if the subnet router deployment works, browse to the `Machines` on the tailscale portal, the subnet router should show up there.
+
+One more config is necessary, `TEST_E2E_USE_INTERNAL_IP=true`, you can use it as a variable when running tests as the following:
+
+```sh
+TEST_E2E_USE_INTERNAL_IP=true make test-e2e-all
+```
 
 ### Deploy AKS only
 

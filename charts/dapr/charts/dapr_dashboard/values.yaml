@@ -1,10 +1,12 @@
+enabled: true
 replicaCount: 1
 logLevel: info
+component: dashboard
 
 image:
   registry: docker.io/daprio
   name: dashboard
-  tag: "0.10.0"
+  tag: "0.12.0"
   imagePullSecrets: ""
 
 nameOverride: ""
@@ -14,7 +16,15 @@ ports:
   protocol: TCP
   port: 8080
   targetPort: 8080
-  
+
+ingress:
+  enabled: false
+  className:
+  host:
+  tls:
+    enabled: false
+    secretName:
+
 runAsNonRoot: true
 serviceType: ClusterIP
 resources: {}

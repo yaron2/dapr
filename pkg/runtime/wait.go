@@ -11,6 +11,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+//nolint:forbidigo
 package runtime
 
 import (
@@ -71,7 +72,7 @@ func checkIfOutboundReady(client *http.Client, outboundReadyHealthURL string) er
 	if err != nil {
 		return err
 	}
-	if resp.StatusCode != 204 {
+	if resp.StatusCode != http.StatusNoContent {
 		return fmt.Errorf("HTTP status code %v", resp.StatusCode)
 	}
 

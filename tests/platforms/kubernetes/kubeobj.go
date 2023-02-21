@@ -54,6 +54,9 @@ const (
 
 	// Environmental variable to disable API logging
 	DisableAPILoggingEnvVar = "NO_API_LOGGING"
+
+	// Environmental variable to enable debug logging
+	DebugLoggingEnvVar = "DEBUG_LOGGING"
 )
 
 var (
@@ -68,6 +71,9 @@ var (
 
 	// Controls whether API logging is enabled
 	EnableAPILogging = true
+
+	// Controls whether debug logging is enabled
+	EnableDebugLogging = false
 )
 
 // buildDaprAnnotations creates the Kubernetes Annotations object for dapr test app.
@@ -88,8 +94,11 @@ func buildDaprAnnotations(appDesc AppDescription) map[string]string {
 			"dapr.io/enable-api-logging":                strconv.FormatBool(EnableAPILogging),
 			"dapr.io/disable-builtin-k8s-secret-store":  strconv.FormatBool(appDesc.SecretStoreDisable),
 		}
+		if EnableDebugLogging {
+			annotationObject["dapr.io/log-level"] = "debug"
+		}
 		if !appDesc.IsJob {
-			annotationObject["dapr.io/app-port"] = fmt.Sprintf("%d", appDesc.AppPort)
+			annotationObject["dapr.io/app-port"] = strconv.Itoa(appDesc.AppPort)
 		}
 	}
 	if appDesc.AppProtocol != "" {
@@ -104,10 +113,38 @@ func buildDaprAnnotations(appDesc AppDescription) map[string]string {
 	if appDesc.DaprVolumeMounts != "" {
 		annotationObject["dapr.io/volume-mounts"] = appDesc.DaprVolumeMounts
 	}
-
+	if appDesc.DaprEnv != "" {
+		annotationObject["dapr.io/env"] = appDesc.DaprEnv
+	}
+	if appDesc.UnixDomainSocketPath != "" {
+		annotationObject["dapr.io/unix-domain-socket-path"] = appDesc.UnixDomainSocketPath
+	}
+	if appDesc.EnableAppHealthCheck {
+		annotationObject["dapr.io/enable-app-health-check"] = "true"
+	}
+	if appDesc.AppHealthCheckPath != "" {
+		annotationObject["dapr.io/app-health-check-path"] = appDesc.AppHealthCheckPath
+	}
+	if appDesc.AppHealthProbeInterval != 0 {
+		annotationObject["dapr.io/app-health-probe-interval"] = strconv.Itoa(appDesc.AppHealthProbeInterval)
+	}
+	if appDesc.AppHealthProbeTimeout != 0 {
+		annotationObject["dapr.io/app-health-probe-timeout"] = strconv.Itoa(appDesc.AppHealthProbeTimeout)
+	}
+	if appDesc.AppHealthThreshold != 0 {
+		annotationObject["dapr.io/app-health-threshold"] = strconv.Itoa(appDesc.AppHealthThreshold)
+	}
+	if len(appDesc.PluggableComponents) != 0 {
+		componentNames := make([]string, len(appDesc.PluggableComponents))
+		for idx, component := range appDesc.PluggableComponents {
+			componentNames[idx] = component.Name
+		}
+		annotationObject["dapr.io/pluggable-components"] = strings.Join(componentNames, ",")
+	}
 	if len(appDesc.PlacementAddresses) != 0 {
 		annotationObject["dapr.io/placement-host-address"] = strings.Join(appDesc.PlacementAddresses, ",")
 	}
+
 	return annotationObject
 }
 
@@ -143,6 +180,40 @@ func buildPodTemplate(appDesc AppDescription) apiv1.PodTemplateSpec {
 		}
 	}
 
+	containers := []apiv1.Container{{
+		Name:            appDesc.AppName,
+		Image:           fmt.Sprintf("%s/%s", appDesc.RegistryName, appDesc.ImageName),
+		ImagePullPolicy: apiv1.PullAlways,
+		Ports: []apiv1.ContainerPort{
+			{
+				Name:          "http",
+				Protocol:      apiv1.ProtocolTCP,
+				ContainerPort: DefaultContainerPort,
+			},
+		},
+		Env:          appEnv,
+		VolumeMounts: appDesc.AppVolumeMounts,
+	}}
+
+	containers = append(containers, appDesc.PluggableComponents...)
+
+	nodeSelectorRequirements := appDesc.NodeSelectors
+	if nodeSelectorRequirements == nil {
+		nodeSelectorRequirements = []apiv1.NodeSelectorRequirement{}
+	}
+	nodeSelectorRequirements = append(nodeSelectorRequirements,
+		apiv1.NodeSelectorRequirement{
+			Key:      "kubernetes.io/os",
+			Operator: "In",
+			Values:   []string{TargetOs},
+		},
+		apiv1.NodeSelectorRequirement{
+			Key:      "kubernetes.io/arch",
+			Operator: "In",
+			Values:   []string{TargetArch},
+		},
+	)
+
 	return apiv1.PodTemplateSpec{
 		ObjectMeta: metav1.ObjectMeta{
 			Labels:      labels,
@@ -150,38 +221,13 @@ func buildPodTemplate(appDesc AppDescription) apiv1.PodTemplateSpec {
 		},
 		Spec: apiv1.PodSpec{
 			InitContainers: appDesc.InitContainers,
-			Containers: []apiv1.Container{
-				{
-					Name:            appDesc.AppName,
-					Image:           fmt.Sprintf("%s/%s", appDesc.RegistryName, appDesc.ImageName),
-					ImagePullPolicy: apiv1.PullAlways,
-					Ports: []apiv1.ContainerPort{
-						{
-							Name:          "http",
-							Protocol:      apiv1.ProtocolTCP,
-							ContainerPort: DefaultContainerPort,
-						},
-					},
-					Env: appEnv,
-				},
-			},
+			Containers:     containers,
 			Affinity: &apiv1.Affinity{
 				NodeAffinity: &apiv1.NodeAffinity{
 					RequiredDuringSchedulingIgnoredDuringExecution: &apiv1.NodeSelector{
 						NodeSelectorTerms: []apiv1.NodeSelectorTerm{
 							{
-								MatchExpressions: []apiv1.NodeSelectorRequirement{
-									{
-										Key:      "kubernetes.io/os",
-										Operator: "In",
-										Values:   []string{TargetOs},
-									},
-									{
-										Key:      "kubernetes.io/arch",
-										Operator: "In",
-										Values:   []string{TargetArch},
-									},
-								},
+								MatchExpressions: nodeSelectorRequirements,
 							},
 						},
 					},
@@ -193,7 +239,8 @@ func buildPodTemplate(appDesc AppDescription) apiv1.PodTemplateSpec {
 					Name: appDesc.ImageSecret,
 				},
 			},
-			Volumes: appDesc.Volumes,
+			Volumes:     appDesc.Volumes,
+			Tolerations: appDesc.Tolerations,
 		},
 	}
 }
@@ -243,12 +290,14 @@ func buildJobObject(namespace string, appDesc AppDescription) *batchv1.Job {
 func buildServiceObject(namespace string, appDesc AppDescription) *apiv1.Service {
 	serviceType := apiv1.ServiceTypeClusterIP
 
-	if appDesc.IngressEnabled {
+	if appDesc.ShouldBeExposed() {
 		serviceType = apiv1.ServiceTypeLoadBalancer
 	}
 
 	targetPort := DefaultContainerPort
-	if appDesc.AppPort > 0 {
+	if appDesc.IngressPort > 0 {
+		targetPort = appDesc.IngressPort
+	} else if appDesc.AppPort > 0 {
 		targetPort = appDesc.AppPort
 	}
 
@@ -277,18 +326,20 @@ func buildServiceObject(namespace string, appDesc AppDescription) *apiv1.Service
 }
 
 // buildDaprComponentObject creates dapr component object.
-func buildDaprComponentObject(componentName string, typeName string, metaData []v1alpha1.MetadataItem) *v1alpha1.Component {
+func buildDaprComponentObject(componentName string, typeName string, scopes []string, annotations map[string]string, metaData []v1alpha1.MetadataItem) *v1alpha1.Component {
 	return &v1alpha1.Component{
 		TypeMeta: metav1.TypeMeta{
 			Kind: DaprComponentsKind,
 		},
 		ObjectMeta: metav1.ObjectMeta{
-			Name: componentName,
+			Name:        componentName,
+			Annotations: annotations,
 		},
 		Spec: v1alpha1.ComponentSpec{
 			Type:     typeName,
 			Metadata: metaData,
 		},
+		Scopes: scopes,
 	}
 }
 
@@ -315,4 +366,5 @@ func init() {
 		v, _ := os.LookupEnv(DisableAPILoggingEnvVar)
 		EnableAPILogging = !utils.IsTruthy(v)
 	}
+	EnableDebugLogging = utils.IsTruthy(os.Getenv(DebugLoggingEnvVar))
 }

@@ -15,60 +15,63 @@ package messaging
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"io"
 	"os"
 	"strings"
+	"sync/atomic"
 	"time"
 
-	"github.com/cenkalti/backoff"
-	"github.com/pkg/errors"
+	"github.com/cenkalti/backoff/v4"
 	"github.com/valyala/fasthttp"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
 	nr "github.com/dapr/components-contrib/nameresolution"
-	"github.com/dapr/kit/logger"
-
 	"github.com/dapr/dapr/pkg/channel"
-	"github.com/dapr/dapr/pkg/config"
 	diag "github.com/dapr/dapr/pkg/diagnostics"
-	diag_utils "github.com/dapr/dapr/pkg/diagnostics/utils"
+	diagUtils "github.com/dapr/dapr/pkg/diagnostics/utils"
+	invokev1 "github.com/dapr/dapr/pkg/messaging/v1"
 	"github.com/dapr/dapr/pkg/modes"
+	commonv1pb "github.com/dapr/dapr/pkg/proto/common/v1"
+	internalv1pb "github.com/dapr/dapr/pkg/proto/internals/v1"
 	"github.com/dapr/dapr/pkg/resiliency"
 	"github.com/dapr/dapr/pkg/retry"
 	"github.com/dapr/dapr/utils"
-
-	invokev1 "github.com/dapr/dapr/pkg/messaging/v1"
-	internalv1pb "github.com/dapr/dapr/pkg/proto/internals/v1"
+	"github.com/dapr/kit/logger"
 )
 
 var log = logger.NewLogger("dapr.runtime.direct_messaging")
 
+const streamingUnsupportedErr = "streaming-based service invocation is enabled, but target app %s is running a version of Dapr that does not support it"
+
 // messageClientConnection is the function type to connect to the other
 // applications to send the message using service invocation.
-type messageClientConnection func(ctx context.Context, address, id string, namespace string, skipTLS, recreateIfExists, enableSSL bool, customOpts ...grpc.DialOption) (*grpc.ClientConn, func(), error)
+type messageClientConnection func(ctx context.Context, address string, id string, namespace string, customOpts ...grpc.DialOption) (*grpc.ClientConn, func(destroy bool), error)
 
 // DirectMessaging is the API interface for invoking a remote app.
 type DirectMessaging interface {
 	Invoke(ctx context.Context, targetAppID string, req *invokev1.InvokeMethodRequest) (*invokev1.InvokeMethodResponse, error)
+	SetAppChannel(appChannel channel.AppChannel)
 }
 
 type directMessaging struct {
-	appChannel          channel.AppChannel
-	connectionCreatorFn messageClientConnection
-	appID               string
-	mode                modes.DaprMode
-	grpcPort            int
-	namespace           string
-	resolver            nr.Resolver
-	tracingSpec         config.TracingSpec
-	hostAddress         string
-	hostName            string
-	maxRequestBodySize  int
-	proxy               Proxy
-	readBufferSize      int
-	resiliency          resiliency.Provider
-	isResiliencyEnabled bool
+	appChannel           channel.AppChannel
+	connectionCreatorFn  messageClientConnection
+	appID                string
+	mode                 modes.DaprMode
+	grpcPort             int
+	namespace            string
+	resolver             nr.Resolver
+	hostAddress          string
+	hostName             string
+	maxRequestBodySizeMB int
+	proxy                Proxy
+	readBufferSize       int
+	resiliency           resiliency.Provider
+	isStreamingEnabled   bool
 }
 
 type remoteApp struct {
@@ -77,45 +80,47 @@ type remoteApp struct {
 	address   string
 }
 
+// NewDirectMessaging contains the options for NewDirectMessaging.
+type NewDirectMessagingOpts struct {
+	AppID              string
+	Namespace          string
+	Port               int
+	Mode               modes.DaprMode
+	AppChannel         channel.AppChannel
+	ClientConnFn       messageClientConnection
+	Resolver           nr.Resolver
+	MaxRequestBodySize int
+	Proxy              Proxy
+	ReadBufferSize     int
+	Resiliency         resiliency.Provider
+	IsStreamingEnabled bool
+}
+
 // NewDirectMessaging returns a new direct messaging api.
-func NewDirectMessaging(
-	appID, namespace string,
-	port int, mode modes.DaprMode,
-	appChannel channel.AppChannel,
-	clientConnFn messageClientConnection,
-	resolver nr.Resolver,
-	tracingSpec config.TracingSpec,
-	maxRequestBodySize int,
-	proxy Proxy,
-	readBufferSize int,
-	streamRequestBody bool,
-	resiliency resiliency.Provider,
-	isResiliencyEnabled bool,
-) DirectMessaging {
+func NewDirectMessaging(opts NewDirectMessagingOpts) DirectMessaging {
 	hAddr, _ := utils.GetHostAddress()
 	hName, _ := os.Hostname()
 
 	dm := &directMessaging{
-		appChannel:          appChannel,
-		connectionCreatorFn: clientConnFn,
-		appID:               appID,
-		mode:                mode,
-		grpcPort:            port,
-		namespace:           namespace,
-		resolver:            resolver,
-		tracingSpec:         tracingSpec,
-		hostAddress:         hAddr,
-		hostName:            hName,
-		maxRequestBodySize:  maxRequestBodySize,
-		proxy:               proxy,
-		readBufferSize:      readBufferSize,
-		resiliency:          resiliency,
-		isResiliencyEnabled: isResiliencyEnabled,
+		appID:                opts.AppID,
+		namespace:            opts.Namespace,
+		grpcPort:             opts.Port,
+		mode:                 opts.Mode,
+		appChannel:           opts.AppChannel,
+		connectionCreatorFn:  opts.ClientConnFn,
+		resolver:             opts.Resolver,
+		maxRequestBodySizeMB: opts.MaxRequestBodySize,
+		proxy:                opts.Proxy,
+		readBufferSize:       opts.ReadBufferSize,
+		resiliency:           opts.Resiliency,
+		isStreamingEnabled:   opts.IsStreamingEnabled,
+		hostAddress:          hAddr,
+		hostName:             hName,
 	}
 
-	if proxy != nil {
-		proxy.SetRemoteAppFn(dm.getRemoteApp)
-		proxy.SetTelemetryFn(dm.setContextSpan)
+	if dm.proxy != nil {
+		dm.proxy.SetRemoteAppFn(dm.getRemoteApp)
+		dm.proxy.SetTelemetryFn(dm.setContextSpan)
 	}
 
 	return dm
@@ -134,91 +139,70 @@ func (d *directMessaging) Invoke(ctx context.Context, targetAppID string, req *i
 	return d.invokeWithRetry(ctx, retry.DefaultLinearRetryCount, retry.DefaultLinearBackoffInterval, app, d.invokeRemote, req)
 }
 
+// SetAppChannel sets the appChannel property in the object.
+func (d *directMessaging) SetAppChannel(appChannel channel.AppChannel) {
+	d.appChannel = appChannel
+}
+
 // requestAppIDAndNamespace takes an app id and returns the app id, namespace and error.
 func (d *directMessaging) requestAppIDAndNamespace(targetAppID string) (string, string, error) {
+	if targetAppID == "" {
+		return "", "", errors.New("app id is empty")
+	}
 	items := strings.Split(targetAppID, ".")
-	if len(items) == 1 {
+	switch len(items) {
+	case 1:
 		return targetAppID, d.namespace, nil
-	} else if len(items) == 2 {
+	case 2:
 		return items[0], items[1], nil
-	} else {
-		return "", "", errors.Errorf("invalid app id %s", targetAppID)
+	default:
+		return "", "", fmt.Errorf("invalid app id %s", targetAppID)
 	}
 }
 
-// invokeWithRetry will call a remote endpoint for the specified number of retries and will only retry in the case of transient failures
-// TODO: check why https://github.com/grpc-ecosystem/go-grpc-middleware/blob/master/retry/examples_test.go doesn't recover the connection when target
-// Server shuts down.
+// invokeWithRetry will call a remote endpoint for the specified number of retries and will only retry in the case of transient failures.
+// TODO: check why https://github.com/grpc-ecosystem/go-grpc-middleware/blob/master/retry/examples_test.go doesn't recover the connection when target server shuts down.
 func (d *directMessaging) invokeWithRetry(
 	ctx context.Context,
 	numRetries int,
 	backoffInterval time.Duration,
 	app remoteApp,
-	fn func(ctx context.Context, appID, namespace, appAddress string, req *invokev1.InvokeMethodRequest) (*invokev1.InvokeMethodResponse, error),
+	fn func(ctx context.Context, appID, namespace, appAddress string, req *invokev1.InvokeMethodRequest) (*invokev1.InvokeMethodResponse, func(destroy bool), error),
 	req *invokev1.InvokeMethodRequest,
 ) (*invokev1.InvokeMethodResponse, error) {
-	// TODO: Once resiliency is out of preview, we can have this be the only path.
-	if d.isResiliencyEnabled {
-		if !d.resiliency.PolicyDefined(app.id, resiliency.Endpoint) {
-			retriesExhaustedPath := false // Used to track final error state.
-			nullifyResponsePath := false  // Used to track final response state.
-			policy := d.resiliency.BuiltInPolicy(ctx, resiliency.BuiltInServiceRetries)
-			var resp *invokev1.InvokeMethodResponse
-			err := policy(func(ctx context.Context) (rErr error) {
-				retriesExhaustedPath = false
-				resp, rErr = fn(ctx, app.id, app.namespace, app.address, req)
-				if rErr == nil {
-					return nil
-				}
+	if !d.resiliency.PolicyDefined(app.id, resiliency.EndpointPolicy{}) {
+		// This policy has built-in retries so enable replay in the request
+		req.WithReplay(true)
 
-				code := status.Code(rErr)
-				if code == codes.Unavailable || code == codes.Unauthenticated {
-					_, teardown, connerr := d.connectionCreatorFn(ctx, app.address, app.id, app.namespace, false, true, false)
-					defer teardown()
-					if connerr != nil {
-						nullifyResponsePath = true
-						return backoff.Permanent(connerr)
-					}
-					retriesExhaustedPath = true
-					return rErr
-				}
-				return backoff.Permanent(rErr)
-			})
-			// To maintain consistency with the existing built-in retries, we do some transformations/error handling.
-			if retriesExhaustedPath {
-				return nil, errors.Errorf("failed to invoke target %s after %v retries. Error: %s", app.id, numRetries, err.Error())
+		policyRunner := resiliency.NewRunnerWithOptions(ctx,
+			d.resiliency.BuiltInPolicy(resiliency.BuiltInServiceRetries),
+			resiliency.RunnerOpts[*invokev1.InvokeMethodResponse]{
+				Disposer: resiliency.DisposerCloser[*invokev1.InvokeMethodResponse],
+			},
+		)
+		attempts := atomic.Int32{}
+		return policyRunner(func(ctx context.Context) (*invokev1.InvokeMethodResponse, error) {
+			attempt := attempts.Add(1)
+			rResp, teardown, rErr := fn(ctx, app.id, app.namespace, app.address, req)
+			if rErr == nil {
+				teardown(false)
+				return rResp, nil
 			}
 
-			if nullifyResponsePath {
-				resp = nil
+			code := status.Code(rErr)
+			if code == codes.Unavailable || code == codes.Unauthenticated {
+				// Destroy the connection and force a re-connection on the next attempt
+				teardown(true)
+				return rResp, fmt.Errorf("failed to invoke target %s after %d retries. Error: %w", app.id, attempt-1, rErr)
 			}
-
-			// We're safe to Unwrap here because it's either nil or a permanent error which contains the Unwrap method.
-			return resp, errors.Unwrap(err)
-		}
-		return fn(ctx, app.id, app.namespace, app.address, req)
+			teardown(false)
+			return rResp, backoff.Permanent(rErr)
+		})
 	}
-	for i := 0; i < numRetries; i++ {
-		resp, err := fn(ctx, app.id, app.namespace, app.address, req)
-		if err == nil {
-			return resp, nil
-		}
-		log.Debugf("retry count: %d, grpc call failed, ns: %s, addr: %s, appid: %s, err: %s",
-			i+1, app.namespace, app.address, app.id, err.Error())
-		time.Sleep(backoffInterval)
 
-		code := status.Code(err)
-		if code == codes.Unavailable || code == codes.Unauthenticated {
-			_, teardown, connerr := d.connectionCreatorFn(context.TODO(), app.address, app.id, app.namespace, false, true, false)
-			defer teardown()
-			if connerr != nil {
-				return nil, connerr
-			}
-			continue
-		}
-		return resp, err
-	}
-	return nil, errors.Errorf("failed to invoke target %s after %v retries", app.id, numRetries)
+	resp, teardown, err := fn(ctx, app.id, app.namespace, app.address, req)
+	teardown(false)
+	return resp, err
 }
 
 func (d *directMessaging) invokeLocal(ctx context.Context, req *invokev1.InvokeMethodRequest) (*invokev1.InvokeMethodResponse, error) {
@@ -230,40 +214,232 @@ func (d *directMessaging) invokeLocal(ctx context.Context, req *invokev1.InvokeM
 }
 
 func (d *directMessaging) setContextSpan(ctx context.Context) context.Context {
-	span := diag_utils.SpanFromContext(ctx)
+	span := diagUtils.SpanFromContext(ctx)
 	ctx = diag.SpanContextToGRPCMetadata(ctx, span.SpanContext())
 
 	return ctx
 }
 
-func (d *directMessaging) invokeRemote(ctx context.Context, appID, namespace, appAddress string, req *invokev1.InvokeMethodRequest) (*invokev1.InvokeMethodResponse, error) {
-	conn, teardown, err := d.connectionCreatorFn(context.TODO(), appAddress, appID, namespace, false, false, false)
-	defer teardown()
+func (d *directMessaging) invokeRemote(ctx context.Context, appID, appNamespace, appAddress string, req *invokev1.InvokeMethodRequest) (*invokev1.InvokeMethodResponse, func(destroy bool), error) {
+	conn, teardown, err := d.connectionCreatorFn(context.TODO(), appAddress, appID, appNamespace)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	ctx = d.setContextSpan(ctx)
 
 	d.addForwardedHeadersToMetadata(req)
 	d.addDestinationAppIDHeaderToMetadata(appID, req)
+	d.addCallerAndCalleeAppIDHeaderToMetadata(d.appID, appID, req)
 
 	clientV1 := internalv1pb.NewServiceInvocationClient(conn)
 
-	var opts []grpc.CallOption
-	opts = append(opts, grpc.MaxCallRecvMsgSize(d.maxRequestBodySize*1024*1024), grpc.MaxCallSendMsgSize(d.maxRequestBodySize*1024*1024))
+	opts := []grpc.CallOption{
+		grpc.MaxCallRecvMsgSize(d.maxRequestBodySizeMB << 20),
+		grpc.MaxCallSendMsgSize(d.maxRequestBodySizeMB << 20),
+	}
 
-	resp, err := clientV1.CallLocal(ctx, req.Proto(), opts...)
+	// Set up timers
+	start := time.Now()
+	diag.DefaultMonitoring.ServiceInvocationRequestSent(appID, req.Message().Method)
+
+	var imr *invokev1.InvokeMethodResponse
+	if !d.isStreamingEnabled {
+		imr, err = d.invokeRemoteUnary(ctx, clientV1, req, opts)
+	} else {
+		imr, err = d.invokeRemoteStream(ctx, clientV1, req, appID, opts)
+	}
+
+	// Diagnostics
+	if imr != nil {
+		diag.DefaultMonitoring.ServiceInvocationResponseReceived(appID, req.Message().Method, imr.Status().Code, start)
+	}
+
+	return imr, teardown, err
+}
+
+func (d *directMessaging) invokeRemoteUnary(ctx context.Context, clientV1 internalv1pb.ServiceInvocationClient, req *invokev1.InvokeMethodRequest, opts []grpc.CallOption) (*invokev1.InvokeMethodResponse, error) {
+	pd, err := req.ProtoWithData()
+	if err != nil {
+		return nil, fmt.Errorf("failed to read data from request object: %w", err)
+	}
+
+	resp, err := clientV1.CallLocal(ctx, pd, opts...)
 	if err != nil {
 		return nil, err
 	}
-
 	return invokev1.InternalInvokeResponse(resp)
+}
+
+func (d *directMessaging) invokeRemoteStream(ctx context.Context, clientV1 internalv1pb.ServiceInvocationClient, req *invokev1.InvokeMethodRequest, appID string, opts []grpc.CallOption) (*invokev1.InvokeMethodResponse, error) {
+	stream, err := clientV1.CallLocalStream(ctx, opts...)
+	if err != nil {
+		return nil, err
+	}
+	buf := invokev1.BufPool.Get().(*[]byte)
+	defer func() {
+		invokev1.BufPool.Put(buf)
+	}()
+	r := req.RawData()
+	reqProto := req.Proto()
+	proto := &internalv1pb.InternalInvokeRequestStream{}
+	var (
+		n    int
+		seq  uint32
+		done bool
+	)
+	for {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+
+		// First message only - add the request
+		if reqProto != nil {
+			proto.Request = reqProto
+			reqProto = nil
+		} else {
+			// Reset the object so we can re-use it
+			proto.Reset()
+		}
+
+		if r != nil {
+			n, err = r.Read(*buf)
+			if err == io.EOF {
+				done = true
+			} else if err != nil {
+				return nil, err
+			}
+			if n > 0 {
+				proto.Payload = &commonv1pb.StreamPayload{
+					Data: (*buf)[:n],
+					Seq:  seq,
+				}
+				seq++
+			}
+		} else {
+			done = true
+		}
+
+		// Send the chunk if there's anything to send
+		if proto.Request != nil || proto.Payload != nil {
+			err = stream.SendMsg(proto)
+			if err != nil {
+				return nil, fmt.Errorf("error sending message: %w", err)
+			}
+		}
+
+		// Stop with the last chunk
+		if done {
+			err = stream.CloseSend()
+			if err != nil {
+				return nil, fmt.Errorf("failed to close the send direction of the stream: %w", err)
+			}
+			break
+		}
+	}
+
+	// Read the first chunk of the response
+	chunk := &internalv1pb.InternalInvokeResponseStream{}
+	err = stream.RecvMsg(chunk)
+	if err != nil {
+		// If we get an "Unimplemented" status code, it means that we're connecting to a sidecar that doesn't support CallLocalStream
+		// This happens if we're connecting to an older version of daprd
+		// What we do here depends on whether the request is replayable:
+		// - If the request is replayable, we will re-submit it as unary. This will have a small performance impact due to the additional round-trip, but it will still work (and the warning will remind users to upgrade)
+		// - If the request is not replayable, the data stream has already been consumed at this point so nothing else we can do - just show an error and tell users to upgrade the target app… (or disable streaming for now)
+		// At this point it seems that this is the best we can do, since we cannot detect Unimplemented status codes earlier (unless we send a "ping", which would add latency).
+		// See: // See: https://github.com/grpc/grpc-go/issues/5910
+		if status.Code(err) == codes.Unimplemented {
+			if req.CanReplay() {
+				log.Warnf("App %s does not support streaming-based service invocation (most likely because it's using an older version of Dapr); falling back to unary calls", appID)
+				return d.invokeRemoteUnary(ctx, clientV1, req, opts)
+			} else {
+				log.Errorf("App %s does not support streaming-based service invocation (most likely because it's using an older version of Dapr) and the request is not replayable. Please upgrade the Dapr sidecar used by the target app, or use Resiliency policies to add retries", appID)
+				return nil, fmt.Errorf(streamingUnsupportedErr, appID)
+			}
+		}
+		return nil, err
+	}
+	if chunk.Response == nil || chunk.Response.Status == nil || chunk.Response.Headers == nil {
+		return nil, errors.New("response does not contain the required fields in the leading chunk")
+	}
+	pr, pw := io.Pipe()
+	res, err := invokev1.InternalInvokeResponse(chunk.Response)
+	if err != nil {
+		return nil, err
+	}
+	res.WithRawData(pr)
+	if chunk.Response.Message != nil {
+		res.WithContentType(chunk.Response.Message.ContentType)
+	}
+
+	// Read the response into the stream in the background
+	go func() {
+		var (
+			firstChunk = true
+			lastSeq    uint32
+			readSeq    uint32
+			payload    *commonv1pb.StreamPayload
+			readErr    error
+		)
+		for {
+			if ctx.Err() != nil {
+				pw.CloseWithError(ctx.Err())
+				return
+			}
+
+			// Get the payload from the chunk that was previously read
+			payload = chunk.GetPayload()
+			if payload != nil {
+				readSeq, readErr = ReadChunk(payload, pw)
+				if readErr != nil {
+					pw.CloseWithError(readErr)
+					return
+				}
+
+				// Check if the sequence number is greater than the previous (or 0 for the first chunk)
+				if (firstChunk && readSeq != 0) || (!firstChunk && readSeq != lastSeq+1) {
+					pw.CloseWithError(fmt.Errorf("invalid sequence number received: %d", readSeq))
+					return
+				}
+				lastSeq = readSeq
+				firstChunk = false
+			}
+
+			// Read the next chunk
+			readErr = stream.RecvMsg(chunk)
+			if readErr == io.EOF {
+				// Receiving an io.EOF signifies that the client has stopped sending data over the pipe, so we can stop reading
+				break
+			} else if readErr != nil {
+				pw.CloseWithError(fmt.Errorf("error receiving message: %w", readErr))
+				return
+			}
+
+			if chunk.Response != nil && (chunk.Response.Status != nil || chunk.Response.Headers != nil || chunk.Response.Message != nil) {
+				pw.CloseWithError(errors.New("response metadata found in non-leading chunk"))
+				return
+			}
+		}
+
+		pw.Close()
+	}()
+
+	return res, nil
 }
 
 func (d *directMessaging) addDestinationAppIDHeaderToMetadata(appID string, req *invokev1.InvokeMethodRequest) {
 	req.Metadata()[invokev1.DestinationIDHeader] = &internalv1pb.ListStringValue{
 		Values: []string{appID},
+	}
+}
+
+func (d *directMessaging) addCallerAndCalleeAppIDHeaderToMetadata(callerAppID, calleeAppID string, req *invokev1.InvokeMethodRequest) {
+	req.Metadata()[invokev1.CallerIDHeader] = &internalv1pb.ListStringValue{
+		Values: []string{callerAppID},
+	}
+	req.Metadata()[invokev1.CalleeIDHeader] = &internalv1pb.ListStringValue{
+		Values: []string{calleeAppID},
 	}
 }
 
@@ -306,6 +482,10 @@ func (d *directMessaging) getRemoteApp(appID string) (remoteApp, error) {
 		return remoteApp{}, err
 	}
 
+	if d.resolver == nil {
+		return remoteApp{}, errors.New("name resolver not initialized")
+	}
+
 	request := nr.ResolveRequest{ID: id, Namespace: namespace, Port: d.grpcPort}
 	address, err := d.resolver.ResolveID(request)
 	if err != nil {
@@ -317,4 +497,21 @@ func (d *directMessaging) getRemoteApp(appID string) (remoteApp, error) {
 		id:        id,
 		address:   address,
 	}, nil
+}
+
+// ReadChunk reads a chunk of data from a StreamPayload object.
+// The returned value "seq" indicates the sequence number
+func ReadChunk(payload *commonv1pb.StreamPayload, out io.Writer) (seq uint32, err error) {
+	if len(payload.Data) > 0 {
+		var n int
+		n, err = out.Write(payload.Data)
+		if err != nil {
+			return 0, err
+		}
+		if n != len(payload.Data) {
+			return 0, fmt.Errorf("wrote %d out of %d bytes", n, len(payload.Data))
+		}
+	}
+
+	return payload.Seq, nil
 }

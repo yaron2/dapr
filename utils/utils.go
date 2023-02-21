@@ -14,13 +14,13 @@ limitations under the License.
 package utils
 
 import (
+	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
-	"regexp"
 	"strings"
-	"time"
 
-	corev1 "k8s.io/api/core/v1"
+	"golang.org/x/exp/slices"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
@@ -30,8 +30,6 @@ var (
 	clientSet     *kubernetes.Clientset
 	kubeConfig    *rest.Config
 	KubeConfigVar = "KUBE_CONFIG"
-
-	envRegexp = regexp.MustCompile(`(?m)(,)\s*[a-zA-Z\_][a-zA-Z0-9\_]*=`)
 )
 
 func initKubeConfig() {
@@ -69,63 +67,11 @@ func GetKubeClient() *kubernetes.Clientset {
 	return clientSet
 }
 
-// ToISO8601DateTimeString converts dateTime to ISO8601 Format
-// ISO8601 Format: 2020-01-01T01:01:01.10101Z.
-func ToISO8601DateTimeString(dateTime time.Time) string {
-	return dateTime.UTC().Format("2006-01-02T15:04:05.999999Z")
-}
-
-// add env-vars from annotations.
-func ParseEnvString(envStr string) []corev1.EnvVar {
-	indexes := envRegexp.FindAllStringIndex(envStr, -1)
-	lastEnd := len(envStr)
-	parts := make([]string, len(indexes)+1)
-	for i := len(indexes) - 1; i >= 0; i-- {
-		parts[i+1] = strings.TrimSpace(envStr[indexes[i][0]+1 : lastEnd])
-		lastEnd = indexes[i][0]
-	}
-	parts[0] = envStr[0:lastEnd]
-
-	envVars := make([]corev1.EnvVar, 0)
-	for _, s := range parts {
-		pairs := strings.Split(strings.TrimSpace(s), "=")
-		if len(pairs) != 2 {
-			continue
-		}
-		envVars = append(envVars, corev1.EnvVar{
-			Name:  pairs[0],
-			Value: pairs[1],
-		})
-	}
-
-	return envVars
-}
-
-// ParseVolumeMountsString parses the annotation and returns volume mounts.
-// The format of the annotation is: "mountPath1:hostPath1,mountPath2:hostPath2"
-// The readOnly parameter applies to all mounts.
-func ParseVolumeMountsString(volumeMountStr string, readOnly bool) []corev1.VolumeMount {
-	volumeMounts := make([]corev1.VolumeMount, 0)
-
-	vs := strings.Split(volumeMountStr, ",")
-	for _, v := range vs {
-		vmount := strings.Split(strings.TrimSpace(v), ":")
-		if len(vmount) != 2 {
-			continue
-		}
-		volumeMounts = append(volumeMounts, corev1.VolumeMount{
-			Name:      vmount[0],
-			MountPath: vmount[1],
-			ReadOnly:  readOnly,
-		})
-	}
-	return volumeMounts
-}
-
-// StringSliceContains return true if an array containe the "str" string.
-func StringSliceContains(needle string, haystack []string) bool {
-	for _, item := range haystack {
-		if item == needle {
+// Contains reports whether v is present in s.
+// Similar to https://pkg.go.dev/golang.org/x/exp/slices#Contains.
+func Contains[T comparable](s []T, v T) bool {
+	for _, e := range s {
+		if e == v {
 			return true
 		}
 	}
@@ -141,6 +87,14 @@ func SetEnvVariables(variables map[string]string) error {
 		}
 	}
 	return nil
+}
+
+// GetEnvOrElse get the value from the OS environment or use the else value if variable is not present.
+func GetEnvOrElse(name, orElse string) string {
+	if value, ok := os.LookupEnv(name); ok {
+		return value
+	}
+	return orElse
 }
 
 // IsTruthy returns true if a string is a truthy value.
@@ -161,4 +115,65 @@ func IsYaml(fileName string) bool {
 		return true
 	}
 	return false
+}
+
+// GetIntValOrDefault returns an int value if greater than 0 OR default value.
+func GetIntValOrDefault(val int, defaultValue int) int {
+	if val > 0 {
+		return val
+	}
+	return defaultValue
+}
+
+// IsSocket returns if the given file is a unix socket.
+func IsSocket(f fs.FileInfo) bool {
+	return f.Mode()&fs.ModeSocket != 0
+}
+
+// SocketExists returns true if the file in that path is an unix socket.
+func SocketExists(socketPath string) bool {
+	if s, err := os.Stat(socketPath); err == nil {
+		return IsSocket(s)
+	}
+	return false
+}
+
+func PopulateMetadataForBulkPublishEntry(reqMeta, entryMeta map[string]string) map[string]string {
+	resMeta := map[string]string{}
+	for k, v := range entryMeta {
+		resMeta[k] = v
+	}
+	for k, v := range reqMeta {
+		if _, ok := resMeta[k]; !ok {
+			// Populate only metadata key that is already not present in the entry level metadata map
+			resMeta[k] = v
+		}
+	}
+
+	return resMeta
+}
+
+// Filter returns a new slice containing all items in the given slice that satisfy the given test.
+func Filter[T any](items []T, test func(item T) bool) []T {
+	filteredItems := make([]T, 0, len(items))
+	for _, value := range items {
+		if test(value) {
+			filteredItems = append(filteredItems, value)
+		}
+	}
+	return slices.Clip(filteredItems)
+}
+
+const (
+	logNameFmt        = "%s (%s)"
+	logNameVersionFmt = "%s (%s/%s)"
+)
+
+// ComponentLogName returns the name of a component that can be used in logging.
+func ComponentLogName(name, typ, version string) string {
+	if version == "" {
+		return fmt.Sprintf(logNameFmt, name, typ)
+	}
+
+	return fmt.Sprintf(logNameVersionFmt, name, typ, version)
 }

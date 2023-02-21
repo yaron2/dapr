@@ -254,7 +254,7 @@ func (p *Service) processRaftStateCommand(stopCh chan struct{}) {
 
 						// ApplyCommand returns true only if the command changes hashing table.
 						if updated {
-							p.memberUpdateCount.Inc()
+							p.memberUpdateCount.Add(1)
 							// disseminateNextTime will be updated whenever apply is done, so that
 							// it will keep moving the time to disseminate the table, which will
 							// reduce the unnecessary table dissemination.
@@ -379,8 +379,8 @@ func (p *Service) disseminateOperation(targets []placementGRPCStream, operation 
 				// Check stream in stream pool, if stream is not available, skip to next.
 				if !p.hasStreamConn(s) {
 					remoteAddr := "n/a"
-					if _peer, ok := peer.FromContext(s.Context()); ok {
-						remoteAddr = _peer.Addr.String()
+					if p, ok := peer.FromContext(s.Context()); ok {
+						remoteAddr = p.Addr.String()
 					}
 					log.Debugf("runtime host (%q) is disconnected with server. go with next dissemination (operation: %s).", remoteAddr, operation)
 					return nil
@@ -389,8 +389,8 @@ func (p *Service) disseminateOperation(targets []placementGRPCStream, operation 
 				err = s.Send(o)
 				if err != nil {
 					remoteAddr := "n/a"
-					if _peer, ok := peer.FromContext(s.Context()); ok {
-						remoteAddr = _peer.Addr.String()
+					if p, ok := peer.FromContext(s.Context()); ok {
+						remoteAddr = p.Addr.String()
 					}
 					log.Errorf("error updating runtime host (%q) on %q operation: %s", remoteAddr, operation, err)
 					return err

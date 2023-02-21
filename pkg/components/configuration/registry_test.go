@@ -14,15 +14,15 @@ limitations under the License.
 package configuration_test
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
-	"github.com/pkg/errors"
 	"github.com/stretchr/testify/assert"
 
-	"github.com/dapr/dapr/pkg/components/configuration"
-
 	c "github.com/dapr/components-contrib/configuration"
+	"github.com/dapr/dapr/pkg/components/configuration"
+	"github.com/dapr/kit/logger"
 )
 
 type mockState struct {
@@ -44,28 +44,28 @@ func TestRegistry(t *testing.T) {
 		mockV2 := &mockState{}
 
 		// act
-		testRegistry.Register(configuration.New(stateName, func() c.Store {
+		testRegistry.RegisterComponent(func(_ logger.Logger) c.Store {
 			return mock
-		}))
-		testRegistry.Register(configuration.New(stateNameV2, func() c.Store {
+		}, stateName)
+		testRegistry.RegisterComponent(func(_ logger.Logger) c.Store {
 			return mockV2
-		}))
+		}, stateNameV2)
 
 		// assert v0 and v1
-		p, e := testRegistry.Create(componentName, "v0")
+		p, e := testRegistry.Create(componentName, "v0", "")
 		assert.NoError(t, e)
 		assert.Same(t, mock, p)
-		p, e = testRegistry.Create(componentName, "v1")
+		p, e = testRegistry.Create(componentName, "v1", "")
 		assert.NoError(t, e)
 		assert.Same(t, mock, p)
 
 		// assert v2
-		pV2, e := testRegistry.Create(componentName, "v2")
+		pV2, e := testRegistry.Create(componentName, "v2", "")
 		assert.NoError(t, e)
 		assert.Same(t, mockV2, pV2)
 
 		// check case-insensitivity
-		pV2, e = testRegistry.Create(strings.ToUpper(componentName), "V2")
+		pV2, e = testRegistry.Create(strings.ToUpper(componentName), "V2", "")
 		assert.NoError(t, e)
 		assert.Same(t, mockV2, pV2)
 	})
@@ -77,8 +77,8 @@ func TestRegistry(t *testing.T) {
 		)
 
 		// act
-		p, actualError := testRegistry.Create(componentName, "v1")
-		expectedError := errors.Errorf("couldn't find configuration store %s/v1", componentName)
+		p, actualError := testRegistry.Create(componentName, "v1", "")
+		expectedError := fmt.Errorf("couldn't find configuration store %s/v1", componentName)
 
 		// assert
 		assert.Nil(t, p)

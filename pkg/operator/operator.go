@@ -15,6 +15,7 @@ package operator
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"k8s.io/apimachinery/pkg/runtime"
@@ -27,13 +28,13 @@ import (
 	componentsapi "github.com/dapr/dapr/pkg/apis/components/v1alpha1"
 	configurationapi "github.com/dapr/dapr/pkg/apis/configuration/v1alpha1"
 	resiliencyapi "github.com/dapr/dapr/pkg/apis/resiliency/v1alpha1"
-	subscriptionsapi_v1alpha1 "github.com/dapr/dapr/pkg/apis/subscriptions/v1alpha1"
-	subscriptionsapi_v2alpha1 "github.com/dapr/dapr/pkg/apis/subscriptions/v2alpha1"
+	subscriptionsapiV1alpha1 "github.com/dapr/dapr/pkg/apis/subscriptions/v1alpha1"
+	subscriptionsapiV2alpha1 "github.com/dapr/dapr/pkg/apis/subscriptions/v2alpha1"
 	"github.com/dapr/dapr/pkg/credentials"
-	"github.com/dapr/dapr/pkg/fswatcher"
 	"github.com/dapr/dapr/pkg/health"
 	"github.com/dapr/dapr/pkg/operator/api"
 	"github.com/dapr/dapr/pkg/operator/handlers"
+	"github.com/dapr/kit/fswatcher"
 	"github.com/dapr/kit/logger"
 )
 
@@ -56,11 +57,12 @@ type Options struct {
 	WatchdogEnabled           bool
 	WatchdogInterval          time.Duration
 	WatchdogMaxRestartsPerMin int
+	WatchNamespace            string
+	ServiceReconcilerEnabled  bool
 }
 
 type operator struct {
-	daprHandler *handlers.DaprHandler
-	apiServer   api.Server
+	apiServer api.Server
 
 	configName    string
 	certChainPath string
@@ -78,46 +80,54 @@ func init() {
 	_ = componentsapi.AddToScheme(scheme)
 	_ = configurationapi.AddToScheme(scheme)
 	_ = resiliencyapi.AddToScheme(scheme)
-	_ = subscriptionsapi_v1alpha1.AddToScheme(scheme)
-	_ = subscriptionsapi_v2alpha1.AddToScheme(scheme)
+	_ = subscriptionsapiV1alpha1.AddToScheme(scheme)
+	_ = subscriptionsapiV2alpha1.AddToScheme(scheme)
 }
 
 // NewOperator returns a new Dapr Operator.
 func NewOperator(opts Options) Operator {
 	conf, err := ctrl.GetConfig()
 	if err != nil {
-		log.Fatalf("unable to get controller runtime configuration, err: %s", err)
+		log.Fatalf("Unable to get controller runtime configuration, err: %s", err)
 	}
 	mgr, err := ctrl.NewManager(conf, ctrl.Options{
 		Scheme:             scheme,
 		MetricsBindAddress: "0",
 		LeaderElection:     opts.LeaderElection,
 		LeaderElectionID:   "operator.dapr.io",
+		Namespace:          opts.WatchNamespace,
 	})
 	if err != nil {
-		log.Fatalf("unable to start manager, err: %s", err)
+		log.Fatalf("Unable to start manager, err: %s", err)
 	}
 	mgrClient := mgr.GetClient()
 
-	wd := &DaprWatchdog{
-		client:            mgrClient,
-		enabled:           opts.WatchdogEnabled,
-		interval:          opts.WatchdogInterval,
-		maxRestartsPerMin: opts.WatchdogMaxRestartsPerMin,
-	}
-	err = mgr.Add(wd)
-	if err != nil {
-		log.Fatalf("unable to add watchdog controller, err: %s", err)
+	if opts.WatchdogEnabled {
+		if !opts.LeaderElection {
+			log.Warn("Leadership election is forcibly enabled when the Dapr Watchdog is enabled")
+		}
+		wd := &DaprWatchdog{
+			client:            mgrClient,
+			interval:          opts.WatchdogInterval,
+			maxRestartsPerMin: opts.WatchdogMaxRestartsPerMin,
+		}
+		err = mgr.Add(wd)
+		if err != nil {
+			log.Fatalf("Unable to add watchdog controller, err: %s", err)
+		}
+	} else {
+		log.Infof("Dapr Watchdog is not enabled")
 	}
 
-	daprHandler := handlers.NewDaprHandler(mgr)
-	err = daprHandler.Init()
-	if err != nil {
-		log.Fatalf("unable to initialize handler, err: %s", err)
+	if opts.ServiceReconcilerEnabled {
+		daprHandler := handlers.NewDaprHandler(mgr)
+		err = daprHandler.Init()
+		if err != nil {
+			log.Fatalf("Unable to initialize handler, err: %s", err)
+		}
 	}
 
 	o := &operator{
-		daprHandler:   daprHandler,
 		mgr:           mgr,
 		client:        mgrClient,
 		configName:    opts.Config,
@@ -129,15 +139,15 @@ func NewOperator(opts Options) Operator {
 	componentInformer, err := mgr.GetCache().GetInformer(ctx, &componentsapi.Component{})
 	cancel()
 	if err != nil {
-		log.Fatalf("unable to get setup components informer, err: %s", err)
-	} else {
-		componentInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
-			AddFunc: o.syncComponent,
-			UpdateFunc: func(_, newObj interface{}) {
-				o.syncComponent(newObj)
-			},
-		})
+		log.Fatalf("Unable to get setup components informer, err: %s", err)
 	}
+
+	componentInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc: o.syncComponent,
+		UpdateFunc: func(_, newObj any) {
+			o.syncComponent(newObj)
+		},
+	})
 
 	return o
 }
@@ -146,46 +156,47 @@ func (o *operator) prepareConfig() {
 	var err error
 	o.config, err = LoadConfiguration(o.configName, o.client)
 	if err != nil {
-		log.Fatalf("unable to load configuration, config: %s, err: %s", o.configName, err)
+		log.Fatalf("Unable to load configuration, config: %s, err: %s", o.configName, err)
 	}
 	o.config.Credentials = credentials.NewTLSCredentials(o.certChainPath)
 }
 
-func (o *operator) syncComponent(obj interface{}) {
+func (o *operator) syncComponent(obj any) {
 	c, ok := obj.(*componentsapi.Component)
 	if ok {
-		log.Debugf("observed component to be synced, %s/%s", c.Namespace, c.Name)
+		log.Debugf("Observed component to be synced, %s/%s", c.Namespace, c.Name)
 		o.apiServer.OnComponentUpdated(c)
 	}
 }
 
 func (o *operator) loadCertChain(ctx context.Context) (certChain *credentials.CertChain) {
-	log.Info("getting tls certificates")
+	log.Info("Getting TLS certificates")
 
 	watchCtx, watchCancel := context.WithTimeout(ctx, time.Minute)
 	fsevent := make(chan struct{})
 	go func() {
-		log.Infof("starting watch for certs on filesystem: %s", o.config.Credentials.Path())
+		log.Infof("Starting watch for certs on filesystem: %s", o.config.Credentials.Path())
 		err := fswatcher.Watch(watchCtx, o.config.Credentials.Path(), fsevent)
-		if err != nil {
-			log.Fatal("error starting watch on filesystem: %s", err)
+		// Watch always returns an error, which is context.Canceled if everything went well
+		if err != nil && !errors.Is(err, context.Canceled) {
+			log.Fatalf("Error starting watch on filesystem: %s", err)
 		}
 		close(fsevent)
 		if watchCtx.Err() == context.DeadlineExceeded {
-			log.Fatal("timeout while waiting to load tls certificates")
+			log.Fatal("Timeout while waiting to load TLS certificates")
 		}
 	}()
 
 	for {
 		chain, err := credentials.LoadFromDisk(o.config.Credentials.RootCertPath(), o.config.Credentials.CertPath(), o.config.Credentials.KeyPath())
 		if err == nil {
-			log.Info("tls certificates loaded successfully")
+			log.Info("TLS certificates loaded successfully")
 			certChain = chain
 			break
 		}
-		log.Infof("tls certificate not found; waiting for disk changes. err=%v", err)
+		log.Infof("TLS certificate not found; waiting for disk changes. err=%v", err)
 		<-fsevent
-		log.Debug("watcher found activity on filesystem")
+		log.Debug("Watcher found activity on filesystem")
 	}
 
 	watchCancel()
@@ -200,11 +211,11 @@ func (o *operator) Run(ctx context.Context) {
 
 	go func() {
 		if err := o.mgr.Start(ctx); err != nil {
-			log.Fatalf("failed to start controller manager, err: %s", err)
+			log.Fatalf("Failed to start controller manager, err: %s", err)
 		}
 	}()
 	if !o.mgr.GetCache().WaitForCacheSync(ctx) {
-		log.Fatalf("failed to wait for cache sync")
+		log.Fatalf("Failed to wait for cache sync")
 	}
 	o.prepareConfig()
 
@@ -217,7 +228,7 @@ func (o *operator) Run(ctx context.Context) {
 		// blocking call
 		err := healthzServer.Run(ctx, healthzPort)
 		if err != nil {
-			log.Fatalf("failed to start healthz server: %s", err)
+			log.Fatalf("Failed to start healthz server: %s", err)
 		}
 	}()
 

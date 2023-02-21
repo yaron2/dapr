@@ -17,7 +17,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log"
 	"os"
 	"time"
@@ -106,11 +105,7 @@ func (m *AppManager) Init(runCtx context.Context) error {
 		return err
 	}
 
-	m.logPrefix = os.Getenv(ContainerLogPathEnvVar)
-
-	if m.logPrefix == "" {
-		m.logPrefix = ContainerLogDefaultPath
-	}
+	m.logPrefix = logPrefix
 
 	if err := os.MkdirAll(m.logPrefix, os.ModePerm); err != nil {
 		log.Printf("Failed to create output log directory '%s' Error was: '%s'. Container logs will be discarded", m.logPrefix, err)
@@ -311,12 +306,21 @@ func (m *AppManager) WaitUntilDeploymentState(isState func(*appsv1.Deployment, e
 		podStatus := map[string][]apiv1.ContainerStatus{}
 		if err == nil {
 			for i, pod := range podList.Items {
+				name := pod.Name
+				podStatus[name] = pod.Status.ContainerStatuses
+				request := podClient.GetLogs(name, &apiv1.PodLogOptions{
+					Container: DaprSideCarName,
+					Previous:  true,
+				})
+				var body []byte
+				if body, err = request.DoRaw(context.Background()); err != nil {
+					log.Printf("(%s) get previous pod log failed. err: %s\n", name, err.Error())
+				}
+				log.Printf("previous pod: %s, logs: %s\n", name, string(body))
 				// Reset Spec and ObjectMeta which could contain sensitive info like credentials
 				pod.Spec.Reset()
 				pod.ObjectMeta.Reset()
 				podList.Items[i] = pod
-
-				podStatus[pod.Name] = pod.Status.ContainerStatuses
 			}
 			j, _ := json.Marshal(podList)
 			log.Printf("deployment %s relate pods: %s", m.app.AppName, string(j))
@@ -616,25 +620,26 @@ func (m *AppManager) WaitUntilServiceState(isState func(*apiv1.Service, error) b
 
 // AcquireExternalURLFromService gets external url from Service Object.
 func (m *AppManager) AcquireExternalURLFromService(svc *apiv1.Service) string {
-	if svc.Status.LoadBalancer.Ingress != nil && len(svc.Status.LoadBalancer.Ingress) > 0 && len(svc.Spec.Ports) > 0 {
-		address := ""
-		if svc.Status.LoadBalancer.Ingress[0].Hostname != "" {
-			address = svc.Status.LoadBalancer.Ingress[0].Hostname
+	svcPorts := svc.Spec.Ports
+	if len(svcPorts) == 0 {
+		return ""
+	}
+
+	svcFstPort, svcIngress := svcPorts[0], svc.Status.LoadBalancer.Ingress
+	// the default service address is the internal one
+	address, port := svc.Spec.ClusterIP, svcFstPort.Port
+	if svcIngress != nil && len(svcIngress) > 0 {
+		if svcIngress[0].Hostname != "" {
+			address = svcIngress[0].Hostname
 		} else {
-			address = svc.Status.LoadBalancer.Ingress[0].IP
+			address = svcIngress[0].IP
 		}
-		return fmt.Sprintf("%s:%d", address, svc.Spec.Ports[0].Port)
-	}
-
-	// TODO: Support the other local k8s clusters
-	if minikubeExternalIP := m.minikubeNodeIP(); minikubeExternalIP != "" {
+		// TODO: Support the other local k8s clusters
+	} else if minikubeExternalIP := m.minikubeNodeIP(); minikubeExternalIP != "" {
 		// if test cluster is minikube, external ip address is minikube node address
-		if len(svc.Spec.Ports) > 0 {
-			return fmt.Sprintf("%s:%d", minikubeExternalIP, svc.Spec.Ports[0].NodePort)
-		}
+		address, port = minikubeExternalIP, svcFstPort.NodePort
 	}
-
-	return ""
+	return fmt.Sprintf("%s:%d", address, port)
 }
 
 // IsServiceIngressReady returns true if external ip is available.
@@ -647,11 +652,9 @@ func (m *AppManager) IsServiceIngressReady(svc *apiv1.Service, err error) bool {
 		return true
 	}
 
-	// TODO: Support the other local k8s clusters
-	if m.minikubeNodeIP() != "" {
-		if len(svc.Spec.Ports) > 0 {
-			return true
-		}
+	if len(svc.Spec.Ports) > 0 {
+		// TODO: Support the other local k8s clusters
+		return m.minikubeNodeIP() != "" || !m.app.ShouldBeExposed()
 	}
 
 	return false
@@ -702,7 +705,7 @@ func (m *AppManager) DeleteDeployment(ignoreNotFound bool) error {
 	return nil
 }
 
-// DeleteService deletes deployment for the test app.
+// DeleteService deletes service for the test app.
 func (m *AppManager) DeleteService(ignoreNotFound bool) error {
 	serviceClient := m.client.Services(m.namespace)
 	deletePolicy := metav1.DeletePropagationForeground
@@ -769,67 +772,9 @@ func (m *AppManager) GetHostDetails() ([]PodInfo, error) {
 	return result, nil
 }
 
-// SaveContainerLogs get container logs for all containers in the pod and saves them to disk.
+// StreamContainerLogs get container logs for all containers in the pod and saves them to disk.
 func (m *AppManager) StreamContainerLogs() error {
-	podClient := m.client.Pods(m.namespace)
-
-	// Filter only 'testapp=appName' labeled Pods
-	ctx, cancel := context.WithTimeout(m.ctx, 15*time.Second)
-	podList, err := podClient.List(ctx, metav1.ListOptions{
-		LabelSelector: fmt.Sprintf("%s=%s", TestAppLabelKey, m.app.AppName),
-	})
-	cancel()
-	if err != nil {
-		return err
-	}
-
-	for _, pod := range podList.Items {
-		for _, container := range pod.Spec.Containers {
-			go func(pod, container string) {
-				filename := fmt.Sprintf("%s/%s.%s.log", m.logPrefix, pod, container)
-				log.Printf("Streaming Kubernetes logs to %s", filename)
-				req := podClient.GetLogs(pod, &apiv1.PodLogOptions{
-					Container: container,
-					Follow:    true,
-				})
-				stream, err := req.Stream(m.ctx)
-				if err != nil {
-					if err != context.Canceled {
-						log.Printf("Error reading log stream for %s. Error was %s", filename, err)
-					} else {
-						log.Printf("Saved container logs to %s", filename)
-					}
-					return
-				}
-				defer stream.Close()
-
-				fh, err := os.Create(filename)
-				if err != nil {
-					if err != context.Canceled {
-						log.Printf("Error creating %s. Error was %s", filename, err)
-					} else {
-						log.Printf("Saved container logs to %s", filename)
-					}
-					return
-				}
-				defer fh.Close()
-
-				_, err = io.Copy(fh, stream)
-				if err != nil {
-					if err != context.Canceled {
-						log.Printf("Error reading log stream for %s. Error was %s", filename, err)
-					} else {
-						log.Printf("Saved container logs to %s", filename)
-					}
-					return
-				}
-
-				log.Printf("Saved container logs to %s", filename)
-			}(pod.GetName(), container.Name)
-		}
-	}
-
-	return nil
+	return StreamContainerLogsToDisk(m.ctx, m.app.AppName, m.client.Pods(m.namespace))
 }
 
 // GetCPUAndMemory returns the Cpu and Memory usage for the dapr app or sidecar.

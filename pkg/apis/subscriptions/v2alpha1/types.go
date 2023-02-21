@@ -38,13 +38,23 @@ type SubscriptionSpec struct {
 	Pubsubname string `json:"pubsubname"`
 	// The topic name to subscribe to.
 	Topic string `json:"topic"`
-	// The optional metadata to provide the the subscription.
+	// The optional metadata to provide the subscription.
 	// +optional
 	Metadata map[string]string `json:"metadata,omitempty"`
 	// The Routes configuration for this topic.
 	Routes Routes `json:"routes"`
 	// The optional dead letter queue for this topic to send events to.
 	DeadLetterTopic string `json:"deadLetterTopic,omitempty"`
+	// The option to enable bulk subscription for this topic.
+	BulkSubscribe BulkSubscribe `json:"bulkSubscribe,omitempty"`
+}
+
+// BulkSubscribe encapsulates the bulk subscription configuration for a topic.
+type BulkSubscribe struct {
+	Enabled bool `json:"enabled"`
+	// +optional
+	MaxMessagesCount   int32 `json:"maxMessagesCount,omitempty"`
+	MaxAwaitDurationMs int32 `json:"maxAwaitDurationMs,omitempty"`
 }
 
 // Routes encapsulates the rules and optional default path for a topic.

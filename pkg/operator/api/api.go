@@ -15,35 +15,30 @@ package api
 
 import (
 	"context"
+	b64 "encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net"
 	"sync"
 	"time"
 
-	"google.golang.org/protobuf/types/known/emptypb"
-
-	b64 "encoding/base64"
-
 	"github.com/google/uuid"
-	"github.com/pkg/errors"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
-	"k8s.io/apimachinery/pkg/types"
-	"sigs.k8s.io/controller-runtime/pkg/client"
-
-	"github.com/dapr/kit/logger"
-
+	"google.golang.org/protobuf/types/known/emptypb"
 	corev1 "k8s.io/api/core/v1"
 	v1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	componentsapi "github.com/dapr/dapr/pkg/apis/components/v1alpha1"
 	configurationapi "github.com/dapr/dapr/pkg/apis/configuration/v1alpha1"
 	resiliencyapi "github.com/dapr/dapr/pkg/apis/resiliency/v1alpha1"
-	subscriptionsapi_v2alpha1 "github.com/dapr/dapr/pkg/apis/subscriptions/v2alpha1"
-	dapr_credentials "github.com/dapr/dapr/pkg/credentials"
+	subscriptionsapiV2alpha1 "github.com/dapr/dapr/pkg/apis/subscriptions/v2alpha1"
+	daprCredentials "github.com/dapr/dapr/pkg/credentials"
 	operatorv1pb "github.com/dapr/dapr/pkg/proto/operator/v1"
+	"github.com/dapr/kit/logger"
 )
 
 const serverPort = 6500
@@ -58,7 +53,7 @@ var log = logger.NewLogger("dapr.operator.api")
 
 // Server runs the Dapr API server for components and configurations.
 type Server interface {
-	Run(ctx context.Context, certChain *dapr_credentials.CertChain, onReady func())
+	Run(ctx context.Context, certChain *daprCredentials.CertChain, onReady func())
 	OnComponentUpdated(component *componentsapi.Component)
 }
 
@@ -79,19 +74,19 @@ func NewAPIServer(client client.Client) Server {
 }
 
 // Run starts a new gRPC server.
-func (a *apiServer) Run(ctx context.Context, certChain *dapr_credentials.CertChain, onReady func()) {
-	log.Info("starting gRPC server on port %d", serverPort)
+func (a *apiServer) Run(ctx context.Context, certChain *daprCredentials.CertChain, onReady func()) {
+	log.Infof("starting gRPC server on port %d", serverPort)
 
-	opts, err := dapr_credentials.GetServerOptions(certChain)
+	opts, err := daprCredentials.GetServerOptions(certChain)
 	if err != nil {
-		log.Fatal("error creating gRPC options: %v", err)
+		log.Fatalf("error creating gRPC options: %v", err)
 	}
 	s := grpc.NewServer(opts...)
 	operatorv1pb.RegisterOperatorServer(s, a)
 
 	lis, err := net.Listen("tcp", fmt.Sprintf(":%v", serverPort))
 	if err != nil {
-		log.Fatal("error starting tcp listener: %v", err)
+		log.Fatalf("error starting tcp listener: %v", err)
 	}
 
 	if onReady != nil {
@@ -139,11 +134,11 @@ func (a *apiServer) GetConfiguration(ctx context.Context, in *operatorv1pb.GetCo
 	key := types.NamespacedName{Namespace: in.Namespace, Name: in.Name}
 	var config configurationapi.Configuration
 	if err := a.Client.Get(ctx, key, &config); err != nil {
-		return nil, errors.Wrap(err, "error getting configuration")
+		return nil, fmt.Errorf("error getting configuration: %w", err)
 	}
 	b, err := json.Marshal(&config)
 	if err != nil {
-		return nil, errors.Wrap(err, "error marshalling configuration")
+		return nil, fmt.Errorf("error marshalling configuration: %w", err)
 	}
 	return &operatorv1pb.GetConfigurationResponse{
 		Configuration: b,
@@ -156,7 +151,7 @@ func (a *apiServer) ListComponents(ctx context.Context, in *operatorv1pb.ListCom
 	if err := a.Client.List(ctx, &components, &client.ListOptions{
 		Namespace: in.Namespace,
 	}); err != nil {
-		return nil, errors.Wrap(err, "error getting components")
+		return nil, fmt.Errorf("error getting components: %w", err)
 	}
 	resp := &operatorv1pb.ListComponentResponse{
 		Components: [][]byte{},
@@ -229,11 +224,11 @@ func (a *apiServer) ListSubscriptionsV2(ctx context.Context, in *operatorv1pb.Li
 	}
 
 	// Only the latest/storage version needs to be returned.
-	var subsV2alpha1 subscriptionsapi_v2alpha1.SubscriptionList
+	var subsV2alpha1 subscriptionsapiV2alpha1.SubscriptionList
 	if err := a.Client.List(ctx, &subsV2alpha1, &client.ListOptions{
 		Namespace: in.Namespace,
 	}); err != nil {
-		return nil, errors.Wrap(err, "error getting subscriptions")
+		return nil, fmt.Errorf("error getting subscriptions: %w", err)
 	}
 	for i := range subsV2alpha1.Items {
 		s := subsV2alpha1.Items[i] // Make a copy since we will refer to this as a reference in this loop.
@@ -256,11 +251,11 @@ func (a *apiServer) GetResiliency(ctx context.Context, in *operatorv1pb.GetResil
 	key := types.NamespacedName{Namespace: in.Namespace, Name: in.Name}
 	var resiliencyConfig resiliencyapi.Resiliency
 	if err := a.Client.Get(ctx, key, &resiliencyConfig); err != nil {
-		return nil, errors.Wrap(err, "error getting resiliency")
+		return nil, fmt.Errorf("error getting resiliency: %w", err)
 	}
 	b, err := json.Marshal(&resiliencyConfig)
 	if err != nil {
-		return nil, errors.Wrap(err, "error marshalling resiliency")
+		return nil, fmt.Errorf("error marshalling resiliency: %w", err)
 	}
 	return &operatorv1pb.GetResiliencyResponse{
 		Resiliency: b,
@@ -277,13 +272,13 @@ func (a *apiServer) ListResiliency(ctx context.Context, in *operatorv1pb.ListRes
 	if err := a.Client.List(ctx, &resiliencies, &client.ListOptions{
 		Namespace: in.Namespace,
 	}); err != nil {
-		return nil, errors.Wrap(err, "error listing resiliencies")
+		return nil, fmt.Errorf("error listing resiliencies: %w", err)
 	}
 
 	for _, item := range resiliencies.Items {
 		b, err := json.Marshal(item)
 		if err != nil {
-			log.Warnf("Error unmarshalling resilienc: %s", err)
+			log.Warnf("Error unmarshalling resiliency: %s", err)
 			continue
 		}
 		resp.Resiliencies = append(resp.Resiliencies, b)
@@ -293,7 +288,7 @@ func (a *apiServer) ListResiliency(ctx context.Context, in *operatorv1pb.ListRes
 }
 
 // ComponentUpdate updates Dapr sidecars whenever a component in the cluster is modified.
-func (a *apiServer) ComponentUpdate(in *operatorv1pb.ComponentUpdateRequest, srv operatorv1pb.Operator_ComponentUpdateServer) error {
+func (a *apiServer) ComponentUpdate(in *operatorv1pb.ComponentUpdateRequest, srv operatorv1pb.Operator_ComponentUpdateServer) error { //nolint:nosnakecase
 	log.Info("sidecar connected for component updates")
 	key := uuid.New().String()
 	a.connLock.Lock()

@@ -19,11 +19,11 @@ limitations under the License.
 // https://research.googleblog.com/2017/04/consistent-hashing-with-bounded-loads.html
 //
 // https://github.com/lafikl/consistent/blob/master/consistent.go
-//
 package hashing
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"math"
 	"sort"
@@ -31,7 +31,6 @@ import (
 	"sync/atomic"
 
 	blake2b "github.com/minio/blake2b-simd"
-	"github.com/pkg/errors"
 )
 
 var replicationFactor int
@@ -165,7 +164,6 @@ func (c *Consistent) GetHost(key string) (*Host, error) {
 // to pick the least loaded host that can serve the key
 //
 // It returns ErrNoHosts if the ring has no hosts in it.
-//
 func (c *Consistent) GetLeast(key string) (string, error) {
 	c.RLock()
 	defer c.RUnlock()

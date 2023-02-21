@@ -17,8 +17,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
-
-	"github.com/pkg/errors"
+	"sync"
 )
 
 const (
@@ -34,8 +33,9 @@ const (
 )
 
 var (
-	statesConfiguration = map[string]*StoreConfiguration{}
-	namespace           = os.Getenv("NAMESPACE")
+	statesConfigurationLock sync.Mutex
+	statesConfiguration     = map[string]*StoreConfiguration{}
+	namespace               = os.Getenv("NAMESPACE")
 )
 
 type StoreConfiguration struct {
@@ -54,6 +54,8 @@ func SaveStateConfiguration(storeName string, metadata map[string]string) error 
 		}
 	}
 
+	statesConfigurationLock.Lock()
+	defer statesConfigurationLock.Unlock()
 	statesConfiguration[storeName] = &StoreConfiguration{keyPrefixStrategy: strategy}
 	return nil
 }
@@ -96,6 +98,8 @@ func GetOriginalStateKey(modifiedStateKey string) string {
 }
 
 func getStateConfiguration(storeName string) *StoreConfiguration {
+	statesConfigurationLock.Lock()
+	defer statesConfigurationLock.Unlock()
 	c := statesConfiguration[storeName]
 	if c == nil {
 		c = &StoreConfiguration{keyPrefixStrategy: strategyDefault}
@@ -107,7 +111,7 @@ func getStateConfiguration(storeName string) *StoreConfiguration {
 
 func checkKeyIllegal(key string) error {
 	if strings.Contains(key, daprSeparator) {
-		return errors.Errorf("input key/keyPrefix '%s' can't contain '%s'", key, daprSeparator)
+		return fmt.Errorf("input key/keyPrefix '%s' can't contain '%s'", key, daprSeparator)
 	}
 	return nil
 }

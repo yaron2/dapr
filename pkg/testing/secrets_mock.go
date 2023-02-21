@@ -14,6 +14,7 @@ limitations under the License.
 package testing
 
 import (
+	"context"
 	"errors"
 
 	"github.com/dapr/components-contrib/secretstores"
@@ -21,7 +22,7 @@ import (
 
 type FakeSecretStore struct{}
 
-func (c FakeSecretStore) GetSecret(req secretstores.GetSecretRequest) (secretstores.GetSecretResponse, error) {
+func (c FakeSecretStore) GetSecret(ctx context.Context, req secretstores.GetSecretRequest) (secretstores.GetSecretResponse, error) {
 	if req.Name == "good-key" {
 		return secretstores.GetSecretResponse{
 			Data: map[string]string{"good-key": "life is good"},
@@ -35,7 +36,7 @@ func (c FakeSecretStore) GetSecret(req secretstores.GetSecretRequest) (secretsto
 	return secretstores.GetSecretResponse{}, nil
 }
 
-func (c FakeSecretStore) BulkGetSecret(req secretstores.BulkGetSecretRequest) (secretstores.BulkGetSecretResponse, error) {
+func (c FakeSecretStore) BulkGetSecret(ctx context.Context, req secretstores.BulkGetSecretRequest) (secretstores.BulkGetSecretResponse, error) {
 	response := map[string]map[string]string{}
 	response["good-key"] = map[string]string{"good-key": "life is good"}
 
@@ -44,7 +45,7 @@ func (c FakeSecretStore) BulkGetSecret(req secretstores.BulkGetSecretRequest) (s
 	}, nil
 }
 
-func (c FakeSecretStore) Init(metadata secretstores.Metadata) error {
+func (c FakeSecretStore) Init(ctx context.Context, metadata secretstores.Metadata) error {
 	return nil
 }
 
@@ -52,11 +53,19 @@ func (c FakeSecretStore) Close() error {
 	return nil
 }
 
+func (c FakeSecretStore) Features() []secretstores.Feature {
+	return []secretstores.Feature{secretstores.FeatureMultipleKeyValuesPerSecret}
+}
+
+func (c FakeSecretStore) GetComponentMetadata() map[string]string {
+	return nil
+}
+
 type FailingSecretStore struct {
 	Failure Failure
 }
 
-func (c FailingSecretStore) GetSecret(req secretstores.GetSecretRequest) (secretstores.GetSecretResponse, error) {
+func (c FailingSecretStore) GetSecret(ctx context.Context, req secretstores.GetSecretRequest) (secretstores.GetSecretResponse, error) {
 	err := c.Failure.PerformFailure(req.Name)
 	if err != nil {
 		return secretstores.GetSecretResponse{}, err
@@ -67,7 +76,7 @@ func (c FailingSecretStore) GetSecret(req secretstores.GetSecretRequest) (secret
 	}, nil
 }
 
-func (c FailingSecretStore) BulkGetSecret(req secretstores.BulkGetSecretRequest) (secretstores.BulkGetSecretResponse, error) {
+func (c FailingSecretStore) BulkGetSecret(ctx context.Context, req secretstores.BulkGetSecretRequest) (secretstores.BulkGetSecretResponse, error) {
 	key := req.Metadata["key"]
 	err := c.Failure.PerformFailure(key)
 	if err != nil {
@@ -79,10 +88,18 @@ func (c FailingSecretStore) BulkGetSecret(req secretstores.BulkGetSecretRequest)
 	}, nil
 }
 
-func (c FailingSecretStore) Init(metadata secretstores.Metadata) error {
+func (c FailingSecretStore) Init(ctx context.Context, metadata secretstores.Metadata) error {
 	return nil
 }
 
 func (c FailingSecretStore) Close() error {
+	return nil
+}
+
+func (c FailingSecretStore) Features() []secretstores.Feature {
+	return []secretstores.Feature{}
+}
+
+func (c FailingSecretStore) GetComponentMetadata() map[string]string {
 	return nil
 }

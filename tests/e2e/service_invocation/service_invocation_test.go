@@ -24,20 +24,24 @@ import (
 	"strings"
 	"testing"
 
+	guuid "github.com/google/uuid"
+
+	diagUtils "github.com/dapr/dapr/pkg/diagnostics/utils"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"go.opencensus.io/trace/propagation"
 
 	diag "github.com/dapr/dapr/pkg/diagnostics"
+	invokev1 "github.com/dapr/dapr/pkg/messaging/v1"
 	"github.com/dapr/dapr/tests/e2e/utils"
 	kube "github.com/dapr/dapr/tests/platforms/kubernetes"
 	"github.com/dapr/dapr/tests/runner"
 )
 
 type testCommandRequest struct {
-	RemoteApp        string `json:"remoteApp,omitempty"`
-	Method           string `json:"method,omitempty"`
-	RemoteAppTracing string `json:"remoteAppTracing"`
+	RemoteApp        string  `json:"remoteApp,omitempty"`
+	Method           string  `json:"method,omitempty"`
+	RemoteAppTracing string  `json:"remoteAppTracing"`
+	Message          *string `json:"message"`
 }
 
 type appResponse struct {
@@ -95,6 +99,15 @@ func TestMain(m *testing.M) {
 			Replicas:       1,
 			IngressEnabled: false,
 			MetricsEnabled: true,
+		},
+		{
+			AppName:        "serviceinvocation-callee-2",
+			DaprEnabled:    true,
+			ImageName:      "e2e-service_invocation",
+			Replicas:       1,
+			IngressEnabled: false,
+			MetricsEnabled: true,
+			Config:         "app-channel-pipeline",
 		},
 		{
 			AppName:        "grpcapp",
@@ -449,21 +462,31 @@ func TestHeaders(t *testing.T) {
 		t.Logf("unmarshalling..%s\n", string(resp))
 		err = json.Unmarshal(resp, &appResp)
 
-		actualHeaders := map[string]string{}
-		json.Unmarshal([]byte(appResp.Message), &actualHeaders)
+		actualHeaders := struct {
+			Request  string `json:"request"`
+			Response string `json:"response"`
+			Trailers string `json:"trailers"`
+		}{}
+		err = json.Unmarshal([]byte(appResp.Message), &actualHeaders)
+		require.NoError(t, err, "failed to unmarshal response: %s", appResp.Message)
 		requestHeaders := map[string][]string{}
 		responseHeaders := map[string][]string{}
 		trailerHeaders := map[string][]string{}
-		json.Unmarshal([]byte(actualHeaders["request"]), &requestHeaders)
-		json.Unmarshal([]byte(actualHeaders["response"]), &responseHeaders)
-		json.Unmarshal([]byte(actualHeaders["trailers"]), &trailerHeaders)
+		json.Unmarshal([]byte(actualHeaders.Request), &requestHeaders)
+		json.Unmarshal([]byte(actualHeaders.Response), &responseHeaders)
+		json.Unmarshal([]byte(actualHeaders.Trailers), &trailerHeaders)
 
 		require.NoError(t, err)
-		assert.Equal(t, "application/grpc", requestHeaders["content-type"][0])
-		assert.Equal(t, "127.0.0.1:3000", requestHeaders[":authority"][0])
-		assert.Equal(t, "DaprValue1", requestHeaders["daprtest-request-1"][0])
-		assert.Equal(t, "DaprValue2", requestHeaders["daprtest-request-2"][0])
-		assert.NotNil(t, requestHeaders["user-agent"][0])
+		_ = assert.NotEmpty(t, requestHeaders["content-type"]) &&
+			assert.Equal(t, "application/grpc", requestHeaders["content-type"][0])
+		_ = assert.NotEmpty(t, requestHeaders[":authority"]) &&
+			assert.Equal(t, "127.0.0.1:3000", requestHeaders[":authority"][0])
+		_ = assert.NotEmpty(t, requestHeaders["daprtest-request-1"]) &&
+			assert.Equal(t, "DaprValue1", requestHeaders["daprtest-request-1"][0])
+		_ = assert.NotEmpty(t, requestHeaders["daprtest-request-2"]) &&
+			assert.Equal(t, "DaprValue2", requestHeaders["daprtest-request-2"][0])
+		_ = assert.NotEmpty(t, requestHeaders["user-agent"]) &&
+			assert.NotNil(t, requestHeaders["user-agent"][0])
 		grpcTraceBinRq := requestHeaders["grpc-trace-bin"]
 		if assert.NotNil(t, grpcTraceBinRq, "grpc-trace-bin is missing from the request") {
 			if assert.Equal(t, 1, len(grpcTraceBinRq), "grpc-trace-bin is missing from the request") {
@@ -476,13 +499,24 @@ func TestHeaders(t *testing.T) {
 				assert.NotEqual(t, "", traceParentRq[0], "traceparent is missing from the request")
 			}
 		}
-		assert.Equal(t, hostIP, requestHeaders["x-forwarded-for"][0])
-		assert.Equal(t, hostname, requestHeaders["x-forwarded-host"][0])
-		assert.Equal(t, expectedForwarded, requestHeaders["forwarded"][0])
+		_ = assert.NotEmpty(t, requestHeaders["x-forwarded-for"]) &&
+			assert.Equal(t, hostIP, requestHeaders["x-forwarded-for"][0])
+		_ = assert.NotEmpty(t, requestHeaders["x-forwarded-host"]) &&
+			assert.Equal(t, hostname, requestHeaders["x-forwarded-host"][0])
+		_ = assert.NotEmpty(t, requestHeaders["forwarded"]) &&
+			assert.Equal(t, expectedForwarded, requestHeaders["forwarded"][0])
 
-		assert.Equal(t, "application/grpc", responseHeaders["content-type"][0])
-		assert.Equal(t, "DaprTest-Response-Value-1", responseHeaders["daprtest-response-1"][0])
-		assert.Equal(t, "DaprTest-Response-Value-2", responseHeaders["daprtest-response-2"][0])
+		_ = assert.NotEmpty(t, requestHeaders[invokev1.CallerIDHeader]) &&
+			assert.Equal(t, "serviceinvocation-caller", requestHeaders[invokev1.CallerIDHeader][0])
+		_ = assert.NotEmpty(t, requestHeaders[invokev1.CalleeIDHeader]) &&
+			assert.Equal(t, "grpcapp", requestHeaders[invokev1.CalleeIDHeader][0])
+
+		_ = assert.NotEmpty(t, responseHeaders["content-type"]) &&
+			assert.Equal(t, "application/grpc", responseHeaders["content-type"][0])
+		_ = assert.NotEmpty(t, responseHeaders["daprtest-response-1"]) &&
+			assert.Equal(t, "DaprTest-Response-Value-1", responseHeaders["daprtest-response-1"][0])
+		_ = assert.NotEmpty(t, responseHeaders["daprtest-response-2"]) &&
+			assert.Equal(t, "DaprTest-Response-Value-2", responseHeaders["daprtest-response-2"][0])
 		grpcTraceBinRs := responseHeaders["grpc-trace-bin"]
 		if assert.NotNil(t, grpcTraceBinRs, "grpc-trace-bin is missing from the response") {
 			if assert.Equal(t, 1, len(grpcTraceBinRs), "grpc-trace-bin is missing from the response") {
@@ -496,8 +530,10 @@ func TestHeaders(t *testing.T) {
 			}
 		}
 
-		assert.Equal(t, "DaprTest-Trailer-Value-1", trailerHeaders["daprtest-trailer-1"][0])
-		assert.Equal(t, "DaprTest-Trailer-Value-2", trailerHeaders["daprtest-trailer-2"][0])
+		_ = assert.NotEmpty(t, trailerHeaders["daprtest-trailer-1"]) &&
+			assert.Equal(t, "DaprTest-Trailer-Value-1", trailerHeaders["daprtest-trailer-1"][0])
+		_ = assert.NotEmpty(t, trailerHeaders["daprtest-trailer-2"]) &&
+			assert.Equal(t, "DaprTest-Trailer-Value-2", trailerHeaders["daprtest-trailer-2"][0])
 	})
 
 	t.Run("grpc-to-http", func(t *testing.T) {
@@ -516,31 +552,52 @@ func TestHeaders(t *testing.T) {
 		t.Logf("unmarshalling..%s\n", string(resp))
 		err = json.Unmarshal(resp, &appResp)
 
-		actualHeaders := map[string]string{}
-		json.Unmarshal([]byte(appResp.Message), &actualHeaders)
+		actualHeaders := struct {
+			Request  string `json:"request"`
+			Response string `json:"response"`
+		}{}
+		err = json.Unmarshal([]byte(appResp.Message), &actualHeaders)
+		require.NoError(t, err, "failed to unmarshal response: %s", appResp.Message)
 		requestHeaders := map[string][]string{}
 		responseHeaders := map[string][]string{}
-		json.Unmarshal([]byte(actualHeaders["request"]), &requestHeaders)
-		json.Unmarshal([]byte(actualHeaders["response"]), &responseHeaders)
+		json.Unmarshal([]byte(actualHeaders.Request), &requestHeaders)
+		json.Unmarshal([]byte(actualHeaders.Response), &responseHeaders)
 
 		require.NoError(t, err)
-		assert.NotNil(t, requestHeaders["Content-Length"][0])
-		assert.Equal(t, "text/plain; utf-8", requestHeaders["Content-Type"][0])
-		assert.Equal(t, "localhost:50001", requestHeaders["Dapr-Authority"][0])
-		assert.Equal(t, "DaprValue1", requestHeaders["Daprtest-Request-1"][0])
-		assert.Equal(t, "DaprValue2", requestHeaders["Daprtest-Request-2"][0])
-		assert.NotNil(t, requestHeaders["Traceparent"][0])
-		assert.NotNil(t, requestHeaders["User-Agent"][0])
-		assert.Equal(t, hostIP, requestHeaders["X-Forwarded-For"][0])
-		assert.Equal(t, hostname, requestHeaders["X-Forwarded-Host"][0])
-		assert.Equal(t, expectedForwarded, requestHeaders["Forwarded"][0])
+		_ = assert.NotEmpty(t, requestHeaders["Content-Type"]) &&
+			assert.Equal(t, "text/plain; utf-8", requestHeaders["Content-Type"][0])
+		_ = assert.NotEmpty(t, requestHeaders["Dapr-Authority"]) &&
+			assert.Equal(t, "localhost:50001", requestHeaders["Dapr-Authority"][0])
+		_ = assert.NotEmpty(t, requestHeaders["Daprtest-Request-1"]) &&
+			assert.Equal(t, "DaprValue1", requestHeaders["Daprtest-Request-1"][0])
+		_ = assert.NotEmpty(t, requestHeaders["Daprtest-Request-2"]) &&
+			assert.Equal(t, "DaprValue2", requestHeaders["Daprtest-Request-2"][0])
+		_ = assert.NotEmpty(t, requestHeaders["Traceparent"]) &&
+			assert.NotNil(t, requestHeaders["Traceparent"][0])
+		_ = assert.NotEmpty(t, requestHeaders["User-Agent"]) &&
+			assert.NotNil(t, requestHeaders["User-Agent"][0])
+		_ = assert.NotEmpty(t, requestHeaders["X-Forwarded-For"]) &&
+			assert.Equal(t, hostIP, requestHeaders["X-Forwarded-For"][0])
+		_ = assert.NotEmpty(t, requestHeaders["X-Forwarded-Host"]) &&
+			assert.Equal(t, hostname, requestHeaders["X-Forwarded-Host"][0])
+		_ = assert.NotEmpty(t, requestHeaders["Forwarded"]) &&
+			assert.Equal(t, expectedForwarded, requestHeaders["Forwarded"][0])
 
-		assert.NotNil(t, responseHeaders["dapr-content-length"][0])
-		assert.Equal(t, "application/grpc", responseHeaders["content-type"][0])
-		assert.Equal(t, "application/json; utf-8", responseHeaders["dapr-content-type"][0])
-		assert.NotNil(t, responseHeaders["dapr-date"][0])
-		assert.Equal(t, "DaprTest-Response-Value-1", responseHeaders["daprtest-response-1"][0])
-		assert.Equal(t, "DaprTest-Response-Value-2", responseHeaders["daprtest-response-2"][0])
+		_ = assert.NotEmpty(t, requestHeaders["Dapr-Caller-App-Id"]) &&
+			assert.Equal(t, "serviceinvocation-caller", requestHeaders["Dapr-Caller-App-Id"][0])
+		_ = assert.NotEmpty(t, requestHeaders["Dapr-Callee-App-Id"]) &&
+			assert.Equal(t, "serviceinvocation-callee-0", requestHeaders["Dapr-Callee-App-Id"][0])
+
+		_ = assert.NotEmpty(t, responseHeaders["content-type"]) &&
+			assert.Equal(t, "application/grpc", responseHeaders["content-type"][0])
+		_ = assert.NotEmpty(t, responseHeaders["dapr-content-type"]) &&
+			assert.True(t, strings.HasPrefix(responseHeaders["dapr-content-type"][0], "application/json"))
+		_ = assert.NotEmpty(t, responseHeaders["dapr-date"]) &&
+			assert.NotNil(t, responseHeaders["dapr-date"][0])
+		_ = assert.NotEmpty(t, responseHeaders["daprtest-response-1"]) &&
+			assert.Equal(t, "DaprTest-Response-Value-1", responseHeaders["daprtest-response-1"][0])
+		_ = assert.NotEmpty(t, responseHeaders["daprtest-response-2"]) &&
+			assert.Equal(t, "DaprTest-Response-Value-2", responseHeaders["daprtest-response-2"][0])
 
 		grpcTraceBinRs := responseHeaders["grpc-trace-bin"]
 		if assert.NotNil(t, grpcTraceBinRs, "grpc-trace-bin is missing from the response") {
@@ -566,23 +623,31 @@ func TestHeaders(t *testing.T) {
 		t.Logf("unmarshalling..%s\n", string(resp))
 		err = json.Unmarshal(resp, &appResp)
 
-		actualHeaders := map[string]string{}
-		json.Unmarshal([]byte(appResp.Message), &actualHeaders)
+		actualHeaders := struct {
+			Request  string `json:"request"`
+			Response string `json:"response"`
+		}{}
+		err = json.Unmarshal([]byte(appResp.Message), &actualHeaders)
+		require.NoError(t, err, "failed to unmarshal response: %s", appResp.Message)
 		requestHeaders := map[string][]string{}
 		responseHeaders := map[string][]string{}
-		json.Unmarshal([]byte(actualHeaders["request"]), &requestHeaders)
-		json.Unmarshal([]byte(actualHeaders["response"]), &responseHeaders)
+		json.Unmarshal([]byte(actualHeaders.Request), &requestHeaders)
+		json.Unmarshal([]byte(actualHeaders.Response), &responseHeaders)
 
 		require.NoError(t, err)
 
-		assert.Nil(t, requestHeaders["connection"])
-		assert.Nil(t, requestHeaders["content-length"])
-		assert.True(t, strings.HasPrefix(requestHeaders["dapr-host"][0], "localhost:"))
-		assert.Equal(t, "application/grpc", requestHeaders["content-type"][0])
-		assert.True(t, strings.HasPrefix(requestHeaders[":authority"][0], "127.0.0.1:"))
-		assert.Equal(t, "DaprValue1", requestHeaders["daprtest-request-1"][0])
-		assert.Equal(t, "DaprValue2", requestHeaders["daprtest-request-2"][0])
-		assert.NotNil(t, requestHeaders["user-agent"][0])
+		_ = assert.NotEmpty(t, requestHeaders["dapr-host"]) &&
+			assert.True(t, strings.HasPrefix(requestHeaders["dapr-host"][0], "localhost:"))
+		_ = assert.NotEmpty(t, requestHeaders["content-type"]) &&
+			assert.Equal(t, "application/grpc", requestHeaders["content-type"][0])
+		_ = assert.NotEmpty(t, requestHeaders[":authority"]) &&
+			assert.True(t, strings.HasPrefix(requestHeaders[":authority"][0], "127.0.0.1:"))
+		_ = assert.NotEmpty(t, requestHeaders["daprtest-request-1"]) &&
+			assert.Equal(t, "DaprValue1", requestHeaders["daprtest-request-1"][0])
+		_ = assert.NotEmpty(t, requestHeaders["daprtest-request-1"]) &&
+			assert.Equal(t, "DaprValue2", requestHeaders["daprtest-request-2"][0])
+		_ = assert.NotEmpty(t, requestHeaders["user-agent"]) &&
+			assert.NotNil(t, requestHeaders["user-agent"][0])
 		grpcTraceBinRq := requestHeaders["grpc-trace-bin"]
 		if assert.NotNil(t, grpcTraceBinRq, "grpc-trace-bin is missing from the request") {
 			if assert.Equal(t, 1, len(grpcTraceBinRq), "grpc-trace-bin is missing from the request") {
@@ -595,16 +660,26 @@ func TestHeaders(t *testing.T) {
 				assert.NotEqual(t, "", traceParentRq[0], "traceparent is missing from the request")
 			}
 		}
-		assert.Equal(t, hostIP, requestHeaders["x-forwarded-for"][0])
-		assert.Equal(t, hostname, requestHeaders["x-forwarded-host"][0])
-		assert.Equal(t, expectedForwarded, requestHeaders["forwarded"][0])
+		_ = assert.NotEmpty(t, requestHeaders["x-forwarded-for"]) &&
+			assert.Equal(t, hostIP, requestHeaders["x-forwarded-for"][0])
+		_ = assert.NotEmpty(t, requestHeaders["x-forwarded-host"]) &&
+			assert.Equal(t, hostname, requestHeaders["x-forwarded-host"][0])
+		_ = assert.NotEmpty(t, requestHeaders["forwarded"]) &&
+			assert.Equal(t, expectedForwarded, requestHeaders["forwarded"][0])
 
-		assert.NotNil(t, responseHeaders["Content-Length"][0])
-		assert.Equal(t, "application/json", responseHeaders["Content-Type"][0])
-		assert.NotNil(t, responseHeaders["Date"][0])
-		assert.Equal(t, "DaprTest-Response-Value-1", responseHeaders["Daprtest-Response-1"][0])
-		assert.Equal(t, "DaprTest-Response-Value-2", responseHeaders["Daprtest-Response-2"][0])
-		assert.NotNil(t, responseHeaders["Traceparent"][0])
+		assert.Equal(t, "serviceinvocation-caller", requestHeaders[invokev1.CallerIDHeader][0])
+		assert.Equal(t, "grpcapp", requestHeaders[invokev1.CalleeIDHeader][0])
+
+		_ = assert.NotEmpty(t, responseHeaders["Content-Type"]) &&
+			assert.True(t, strings.HasPrefix(responseHeaders["Content-Type"][0], "application/json"))
+		_ = assert.NotEmpty(t, responseHeaders["Date"]) &&
+			assert.NotNil(t, responseHeaders["Date"][0])
+		_ = assert.NotEmpty(t, responseHeaders["Daprtest-Response-1"]) &&
+			assert.Equal(t, "DaprTest-Response-Value-1", responseHeaders["Daprtest-Response-1"][0])
+		_ = assert.NotEmpty(t, responseHeaders["Daprtest-Response-2"]) &&
+			assert.Equal(t, "DaprTest-Response-Value-2", responseHeaders["Daprtest-Response-2"][0])
+		_ = assert.NotEmpty(t, responseHeaders["Traceparent"]) &&
+			assert.NotNil(t, responseHeaders["Traceparent"][0])
 	})
 
 	/* Tracing specific tests */
@@ -653,14 +728,19 @@ func TestHeaders(t *testing.T) {
 		t.Logf("unmarshalling..%s\n", string(resp))
 		err = json.Unmarshal(resp, &appResp)
 
-		actualHeaders := map[string]string{}
-		json.Unmarshal([]byte(appResp.Message), &actualHeaders)
+		actualHeaders := struct {
+			Request  string `json:"request"`
+			Response string `json:"response"`
+			Trailers string `json:"trailers"`
+		}{}
+		err = json.Unmarshal([]byte(appResp.Message), &actualHeaders)
+		require.NoError(t, err, "failed to unmarshal response: %s", appResp.Message)
 		requestHeaders := map[string][]string{}
 		responseHeaders := map[string][]string{}
 		trailerHeaders := map[string][]string{}
-		json.Unmarshal([]byte(actualHeaders["request"]), &requestHeaders)
-		json.Unmarshal([]byte(actualHeaders["response"]), &responseHeaders)
-		json.Unmarshal([]byte(actualHeaders["trailers"]), &trailerHeaders)
+		json.Unmarshal([]byte(actualHeaders.Request), &requestHeaders)
+		json.Unmarshal([]byte(actualHeaders.Response), &responseHeaders)
+		json.Unmarshal([]byte(actualHeaders.Trailers), &trailerHeaders)
 
 		require.NoError(t, err)
 
@@ -684,7 +764,7 @@ func TestHeaders(t *testing.T) {
 				t.Logf("received response grpc header..%s\n", traceContext)
 				assert.Equal(t, expectedEncodedTraceID, traceContext)
 				decoded, _ := base64.StdEncoding.DecodeString(traceContext)
-				gotSc, ok := propagation.FromBinary(decoded)
+				gotSc, ok := diagUtils.SpanContextFromBinary(decoded)
 
 				assert.True(t, ok)
 				assert.NotNil(t, gotSc)
@@ -716,12 +796,16 @@ func TestHeaders(t *testing.T) {
 		t.Logf("unmarshalling..%s\n", string(resp))
 		err = json.Unmarshal(resp, &appResp)
 
-		actualHeaders := map[string]string{}
-		json.Unmarshal([]byte(appResp.Message), &actualHeaders)
+		actualHeaders := struct {
+			Request  string `json:"request"`
+			Response string `json:"response"`
+		}{}
+		err = json.Unmarshal([]byte(appResp.Message), &actualHeaders)
+		require.NoError(t, err, "failed to unmarshal response: %s", appResp.Message)
 		requestHeaders := map[string][]string{}
 		responseHeaders := map[string][]string{}
-		json.Unmarshal([]byte(actualHeaders["request"]), &requestHeaders)
-		json.Unmarshal([]byte(actualHeaders["response"]), &responseHeaders)
+		json.Unmarshal([]byte(actualHeaders.Request), &requestHeaders)
+		json.Unmarshal([]byte(actualHeaders.Response), &responseHeaders)
 
 		require.NoError(t, err)
 
@@ -750,17 +834,23 @@ func TestHeaders(t *testing.T) {
 		t.Logf("unmarshalling..%s\n", string(resp))
 		err = json.Unmarshal(resp, &appResp)
 
-		actualHeaders := map[string]string{}
-		json.Unmarshal([]byte(appResp.Message), &actualHeaders)
+		actualHeaders := struct {
+			Request  string `json:"request"`
+			Response string `json:"response"`
+		}{}
+		err = json.Unmarshal([]byte(appResp.Message), &actualHeaders)
+		require.NoError(t, err, "failed to unmarshal response: %s", appResp.Message)
 		requestHeaders := map[string][]string{}
 		responseHeaders := map[string][]string{}
-		json.Unmarshal([]byte(actualHeaders["request"]), &requestHeaders)
-		json.Unmarshal([]byte(actualHeaders["response"]), &responseHeaders)
+		json.Unmarshal([]byte(actualHeaders.Request), &requestHeaders)
+		json.Unmarshal([]byte(actualHeaders.Response), &responseHeaders)
 
 		require.NoError(t, err)
 
-		assert.NotNil(t, requestHeaders["Traceparent"][0])
-		assert.Equal(t, expectedTraceID, requestHeaders["Daprtest-Traceid"][0])
+		_ = assert.NotEmpty(t, requestHeaders["Traceparent"]) &&
+			assert.NotNil(t, requestHeaders["Traceparent"][0])
+		_ = assert.NotEmpty(t, requestHeaders["Daprtest-Traceid"]) &&
+			assert.Equal(t, expectedTraceID, requestHeaders["Daprtest-Traceid"][0])
 
 		grpcTraceBinRs := responseHeaders["grpc-trace-bin"]
 		if assert.NotNil(t, grpcTraceBinRs, "grpc-trace-bin is missing from the response") {
@@ -771,7 +861,7 @@ func TestHeaders(t *testing.T) {
 				t.Logf("received response grpc header..%s\n", traceContext)
 				assert.Equal(t, expectedEncodedTraceID, traceContext)
 				decoded, _ := base64.StdEncoding.DecodeString(traceContext)
-				gotSc, ok := propagation.FromBinary(decoded)
+				gotSc, ok := diagUtils.SpanContextFromBinary(decoded)
 
 				assert.True(t, ok)
 				assert.NotNil(t, gotSc)
@@ -797,17 +887,23 @@ func verifyHTTPToHTTPTracing(t *testing.T, url string, expectedTraceID string) {
 	t.Logf("unmarshalling..%s\n", string(resp))
 	err = json.Unmarshal(resp, &appResp)
 
-	actualHeaders := map[string]string{}
-	json.Unmarshal([]byte(appResp.Message), &actualHeaders)
+	actualHeaders := struct {
+		Request  string `json:"request"`
+		Response string `json:"response"`
+	}{}
+	err = json.Unmarshal([]byte(appResp.Message), &actualHeaders)
+	require.NoError(t, err, "failed to unmarshal response: %s", appResp.Message)
 	requestHeaders := map[string][]string{}
 	responseHeaders := map[string][]string{}
-	json.Unmarshal([]byte(actualHeaders["request"]), &requestHeaders)
-	json.Unmarshal([]byte(actualHeaders["response"]), &responseHeaders)
+	json.Unmarshal([]byte(actualHeaders.Request), &requestHeaders)
+	json.Unmarshal([]byte(actualHeaders.Response), &responseHeaders)
 
 	require.NoError(t, err)
 
-	assert.NotNil(t, requestHeaders["Traceparent"][0])
-	assert.Equal(t, expectedTraceID, requestHeaders["Daprtest-Traceid"][0])
+	_ = assert.NotEmpty(t, requestHeaders["Traceparent"]) &&
+		assert.NotNil(t, requestHeaders["Traceparent"][0])
+	_ = assert.NotEmpty(t, requestHeaders["Daprtest-Traceid"]) &&
+		assert.Equal(t, expectedTraceID, requestHeaders["Daprtest-Traceid"][0])
 
 	traceParentRs := responseHeaders["Traceparent"]
 	if assert.NotNil(t, traceParentRs, "Traceparent is missing from the response") {
@@ -832,30 +928,76 @@ func verifyHTTPToHTTP(t *testing.T, hostIP string, hostname string, url string, 
 	t.Logf("unmarshalling..%s\n", string(resp))
 	err = json.Unmarshal(resp, &appResp)
 
-	actualHeaders := map[string]string{}
-	json.Unmarshal([]byte(appResp.Message), &actualHeaders)
+	actualHeaders := struct {
+		Request  string `json:"request"`
+		Response string `json:"response"`
+	}{}
+	err = json.Unmarshal([]byte(appResp.Message), &actualHeaders)
+	require.NoError(t, err, "failed to unmarshal response: %s", appResp.Message)
 	requestHeaders := map[string][]string{}
 	responseHeaders := map[string][]string{}
-	json.Unmarshal([]byte(actualHeaders["request"]), &requestHeaders)
-	json.Unmarshal([]byte(actualHeaders["response"]), &responseHeaders)
+	json.Unmarshal([]byte(actualHeaders.Request), &requestHeaders)
+	json.Unmarshal([]byte(actualHeaders.Response), &responseHeaders)
 
 	require.NoError(t, err)
-	assert.NotNil(t, requestHeaders["Accept-Encoding"][0])
-	assert.NotNil(t, requestHeaders["Content-Length"][0])
-	assert.Equal(t, "application/json", requestHeaders["Content-Type"][0])
-	assert.Equal(t, "DaprValue1", requestHeaders["Daprtest-Request-1"][0])
-	assert.Equal(t, "DaprValue2", requestHeaders["Daprtest-Request-2"][0])
-	assert.NotNil(t, requestHeaders["Traceparent"][0])
-	assert.NotNil(t, requestHeaders["User-Agent"][0])
-	assert.Equal(t, hostIP, requestHeaders["X-Forwarded-For"][0])
-	assert.Equal(t, hostname, requestHeaders["X-Forwarded-Host"][0])
-	assert.Equal(t, expectedForwarded, requestHeaders["Forwarded"][0])
+	_ = assert.NotEmpty(t, requestHeaders["Content-Type"]) &&
+		assert.True(t, strings.HasPrefix(requestHeaders["Content-Type"][0], "application/json"))
+	_ = assert.NotEmpty(t, requestHeaders["Daprtest-Request-1"]) &&
+		assert.Equal(t, "DaprValue1", requestHeaders["Daprtest-Request-1"][0])
+	_ = assert.NotEmpty(t, requestHeaders["Daprtest-Request-2"]) &&
+		assert.Equal(t, "DaprValue2", requestHeaders["Daprtest-Request-2"][0])
+	_ = assert.NotEmpty(t, requestHeaders["Traceparent"]) &&
+		assert.NotNil(t, requestHeaders["Traceparent"][0])
+	_ = assert.NotEmpty(t, requestHeaders["User-Agent"]) &&
+		assert.NotNil(t, requestHeaders["User-Agent"][0])
+	_ = assert.NotEmpty(t, requestHeaders["X-Forwarded-For"]) &&
+		assert.Equal(t, hostIP, requestHeaders["X-Forwarded-For"][0])
+	_ = assert.NotEmpty(t, requestHeaders["X-Forwarded-Host"]) &&
+		assert.Equal(t, hostname, requestHeaders["X-Forwarded-Host"][0])
+	_ = assert.NotEmpty(t, requestHeaders["Forwarded"]) &&
+		assert.Equal(t, expectedForwarded, requestHeaders["Forwarded"][0])
 
-	assert.NotNil(t, responseHeaders["Content-Length"][0])
-	assert.Equal(t, "application/json; utf-8", responseHeaders["Content-Type"][0])
-	assert.Equal(t, "DaprTest-Response-Value-1", responseHeaders["Daprtest-Response-1"][0])
-	assert.Equal(t, "DaprTest-Response-Value-2", responseHeaders["Daprtest-Response-2"][0])
-	assert.NotNil(t, responseHeaders["Traceparent"][0])
+	_ = assert.NotEmpty(t, responseHeaders["Content-Type"]) &&
+		assert.True(t, strings.HasPrefix(responseHeaders["Content-Type"][0], "application/json"))
+	_ = assert.NotEmpty(t, responseHeaders["Daprtest-Response-1"]) &&
+		assert.Equal(t, "DaprTest-Response-Value-1", responseHeaders["Daprtest-Response-1"][0])
+	_ = assert.NotEmpty(t, responseHeaders["Daprtest-Response-2"]) &&
+		assert.Equal(t, "DaprTest-Response-Value-2", responseHeaders["Daprtest-Response-2"][0])
+	_ = assert.NotEmpty(t, responseHeaders["Traceparent"]) &&
+		assert.NotNil(t, responseHeaders["Traceparent"][0])
+}
+
+func TestUppercaseMiddlewareServiceInvocation(t *testing.T) {
+	externalURL := tr.Platform.AcquireAppExternalURL("serviceinvocation-caller")
+	require.NotEmpty(t, externalURL, "external URL must not be empty!")
+
+	// This initial probe makes the test wait a little bit longer when needed,
+	// making this test less flaky due to delays in the deployment.
+	_, err := utils.HTTPGetNTimes(externalURL, numHealthChecks)
+	require.NoError(t, err)
+
+	t.Run("uppercase middleware should be applied", func(t *testing.T) {
+		testMessage := guuid.New().String()
+		body, err := json.Marshal(testCommandRequest{
+			RemoteApp: "serviceinvocation-callee-2",
+			Method:    "httptohttptest",
+			Message:   &testMessage,
+		})
+		require.NoError(t, err)
+
+		resp, err := utils.HTTPPost(
+			fmt.Sprintf("%s/httptohttptest", externalURL), body)
+		t.Log("checking err...")
+		require.NoError(t, err)
+
+		var appResp appResponse
+		t.Logf("unmarshalling..%s\n", string(resp))
+		err = json.Unmarshal(resp, &appResp)
+		require.NoError(t, err)
+
+		uppercaseMsg := strings.ToUpper(testMessage)
+		require.Contains(t, appResp.Message, uppercaseMsg)
+	})
 }
 
 func TestNegativeCases(t *testing.T) {
@@ -987,8 +1129,13 @@ func TestNegativeCases(t *testing.T) {
 
 		require.False(t, testResults.MainCallSuccessful)
 		require.Equal(t, 500, status)
-		require.Contains(t, testResults.RawError, "rpc error: code = DeadlineExceeded desc = context deadline exceeded")
-		require.NotContains(t, testResults.RawError, "Client waited longer than it should have.")
+		// This error could have code either DeadlineExceeded or Internal, depending on where the context timeout was caught
+		// Valid errors are:
+		// - `rpc error: code = Internal desc = fail to invoke, id: serviceinvocation-callee-0, err: rpc error: code = Internal desc = error invoking app channel: Post \"http://127.0.0.1:3000/timeouterror\": context deadline exceeded``
+		// - `rpc error: code = DeadlineExceeded desc = context deadline exceeded`
+		assert.Contains(t, testResults.RawError, "rpc error:")
+		assert.Contains(t, testResults.RawError, "context deadline exceeded")
+		assert.NotContains(t, testResults.RawError, "Client waited longer than it should have.")
 	})
 
 	t.Run("service_parse_error_http", func(t *testing.T) {

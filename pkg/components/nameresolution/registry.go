@@ -14,80 +14,82 @@ limitations under the License.
 package nameresolution
 
 import (
+	"fmt"
 	"strings"
 
-	"github.com/pkg/errors"
-
 	nr "github.com/dapr/components-contrib/nameresolution"
-
 	"github.com/dapr/dapr/pkg/components"
+	"github.com/dapr/kit/logger"
 )
 
 type (
-	// NameResolution is a name resolution component definition.
-	NameResolution struct {
-		Names         []string
-		FactoryMethod func() nr.Resolver
-	}
+	FactoryMethod func(logger.Logger) nr.Resolver
 
 	// Registry handles registering and creating name resolution components.
-	Registry interface {
-		Register(components ...NameResolution)
-		Create(name, version string) (nr.Resolver, error)
-	}
-
-	nameResolutionRegistry struct {
-		resolvers map[string]func() nr.Resolver
+	Registry struct {
+		Logger    logger.Logger
+		resolvers map[string]FactoryMethod
 	}
 )
 
-// New creates a NameResolution.
-func New(name string, factoryMethod func() nr.Resolver, aliases ...string) NameResolution {
-	names := []string{name}
-	if len(aliases) > 0 {
-		names = append(names, aliases...)
-	}
-	return NameResolution{
-		Names:         names,
-		FactoryMethod: factoryMethod,
-	}
+// DefaultRegistry is the singleton with the registry.
+var DefaultRegistry *Registry
+
+func init() {
+	DefaultRegistry = NewRegistry()
 }
 
 // NewRegistry creates a name resolution registry.
-func NewRegistry() Registry {
-	return &nameResolutionRegistry{
-		resolvers: map[string]func() nr.Resolver{},
+func NewRegistry() *Registry {
+	return &Registry{
+		resolvers: map[string]FactoryMethod{},
 	}
 }
 
-// Register adds one or many name resolution components to the registry.
-func (s *nameResolutionRegistry) Register(components ...NameResolution) {
-	for _, component := range components {
-		for _, name := range component.Names {
-			s.resolvers[createFullName(name)] = component.FactoryMethod
-		}
+// RegisterComponent adds a name resolver to the registry.
+func (s *Registry) RegisterComponent(componentFactory FactoryMethod, names ...string) {
+	for _, name := range names {
+		s.resolvers[createFullName(name)] = componentFactory
 	}
 }
 
 // Create instantiates a name resolution resolver based on `name`.
-func (s *nameResolutionRegistry) Create(name, version string) (nr.Resolver, error) {
-	if method, ok := s.getResolver(createFullName(name), version); ok {
+func (s *Registry) Create(name, version, logName string) (nr.Resolver, error) {
+	if method, ok := s.getResolver(createFullName(name), version, logName); ok {
 		return method(), nil
 	}
-	return nil, errors.Errorf("couldn't find name resolver %s/%s", name, version)
+	return nil, fmt.Errorf("couldn't find name resolver %s/%s", name, version)
 }
 
-func (s *nameResolutionRegistry) getResolver(name, version string) (func() nr.Resolver, bool) {
+func (s *Registry) getResolver(name, version, logName string) (func() nr.Resolver, bool) {
+	if s.resolvers == nil {
+		return nil, false
+	}
 	nameLower := strings.ToLower(name)
 	versionLower := strings.ToLower(version)
 	resolverFn, ok := s.resolvers[nameLower+"/"+versionLower]
 	if ok {
-		return resolverFn, true
+		return s.wrapFn(resolverFn, logName), true
 	}
 	if components.IsInitialVersion(versionLower) {
 		resolverFn, ok = s.resolvers[nameLower]
+		if ok {
+			return s.wrapFn(resolverFn, logName), true
+		}
 	}
-	return resolverFn, ok
+	return nil, false
+}
+
+func (s *Registry) wrapFn(componentFactory FactoryMethod, logName string) func() nr.Resolver {
+	return func() nr.Resolver {
+		l := s.Logger
+		if logName != "" && l != nil {
+			l = l.WithFields(map[string]any{
+				"component": logName,
+			})
+		}
+		return componentFactory(l)
+	}
 }
 
 func createFullName(name string) string {

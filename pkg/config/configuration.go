@@ -16,39 +16,48 @@ package config
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"sort"
 	"strings"
 	"time"
 
-	grpc_retry "github.com/grpc-ecosystem/go-grpc-middleware/retry"
-	"github.com/pkg/errors"
+	grpcRetry "github.com/grpc-ecosystem/go-grpc-middleware/retry"
 	yaml "gopkg.in/yaml.v2"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/sets"
 
+	"github.com/dapr/dapr/pkg/buildinfo"
 	operatorv1pb "github.com/dapr/dapr/pkg/proto/operator/v1"
+	"github.com/dapr/dapr/utils"
 )
 
-const (
-	operatorCallTimeout          = time.Second * 5
-	operatorMaxRetries           = 100
-	AllowAccess                  = "allow"
-	DenyAccess                   = "deny"
-	DefaultTrustDomain           = "public"
-	DefaultNamespace             = "default"
-	ActionPolicyApp              = "app"
-	ActionPolicyGlobal           = "global"
-	SpiffeIDPrefix               = "spiffe://"
-	HTTPProtocol                 = "http"
-	GRPCProtocol                 = "grpc"
-	Resiliency           Feature = "Resiliency"
-	NoDefaultContentType Feature = "ServiceInvocation.NoDefaultContentType"
-)
+// Feature Flags section
 
 type Feature string
 
-var noDefaultContentTypeValue = false
+const (
+	// Enable support for streaming in HTTP service invocation
+	ServiceInvocationStreaming Feature = "ServiceInvocationStreaming"
+	// Enables the app health check feature, allowing the use of the CLI flags
+	AppHealthCheck Feature = "AppHealthCheck"
+)
+
+// end feature flags section
+
+const (
+	operatorCallTimeout = time.Second * 5
+	operatorMaxRetries  = 100
+	AllowAccess         = "allow"
+	DenyAccess          = "deny"
+	DefaultTrustDomain  = "public"
+	DefaultNamespace    = "default"
+	ActionPolicyApp     = "app"
+	ActionPolicyGlobal  = "global"
+	SpiffeIDPrefix      = "spiffe://"
+	HTTPProtocol        = "http"
+	GRPCProtocol        = "grpc"
+)
 
 // Configuration is an internal (and duplicate) representation of Dapr's Configuration CRD.
 type Configuration struct {
@@ -57,6 +66,9 @@ type Configuration struct {
 	metav1.ObjectMeta `json:"metadata,omitempty" yaml:"metadata,omitempty"`
 	// See https://github.com/kubernetes/community/blob/master/contributors/devel/sig-architecture/api-conventions.md#spec-and-status
 	Spec ConfigurationSpec `json:"spec" yaml:"spec"`
+
+	// Internal fields
+	featuresEnabled map[Feature]struct{}
 }
 
 // AccessControlList is an in-memory access control list config for fast lookup.
@@ -83,15 +95,19 @@ type AccessControlListOperationAction struct {
 }
 
 type ConfigurationSpec struct {
-	HTTPPipelineSpec   PipelineSpec       `json:"httpPipeline,omitempty" yaml:"httpPipeline,omitempty"`
-	TracingSpec        TracingSpec        `json:"tracing,omitempty" yaml:"tracing,omitempty"`
-	MTLSSpec           MTLSSpec           `json:"mtls,omitempty" yaml:"mtls,omitempty"`
-	MetricSpec         MetricSpec         `json:"metric,omitempty" yaml:"metric,omitempty"`
-	Secrets            SecretsSpec        `json:"secrets,omitempty" yaml:"secrets,omitempty"`
-	AccessControlSpec  AccessControlSpec  `json:"accessControl,omitempty" yaml:"accessControl,omitempty"`
-	NameResolutionSpec NameResolutionSpec `json:"nameResolution,omitempty" yaml:"nameResolution,omitempty"`
-	Features           []FeatureSpec      `json:"features,omitempty" yaml:"features,omitempty"`
-	APISpec            APISpec            `json:"api,omitempty" yaml:"api,omitempty"`
+	HTTPPipelineSpec    PipelineSpec       `json:"httpPipeline,omitempty" yaml:"httpPipeline,omitempty"`
+	AppHTTPPipelineSpec PipelineSpec       `json:"appHttpPipeline,omitempty" yaml:"appHttpPipeline,omitempty"`
+	TracingSpec         TracingSpec        `json:"tracing,omitempty" yaml:"tracing,omitempty"`
+	MTLSSpec            MTLSSpec           `json:"mtls,omitempty" yaml:"mtls,omitempty"`
+	MetricSpec          MetricSpec         `json:"metric,omitempty" yaml:"metric,omitempty"`
+	MetricsSpec         MetricSpec         `json:"metrics,omitempty" yaml:"metrics,omitempty"`
+	Secrets             SecretsSpec        `json:"secrets,omitempty" yaml:"secrets,omitempty"`
+	AccessControlSpec   AccessControlSpec  `json:"accessControl,omitempty" yaml:"accessControl,omitempty"`
+	NameResolutionSpec  NameResolutionSpec `json:"nameResolution,omitempty" yaml:"nameResolution,omitempty"`
+	Features            []FeatureSpec      `json:"features,omitempty" yaml:"features,omitempty"`
+	APISpec             APISpec            `json:"api,omitempty" yaml:"api,omitempty"`
+	ComponentsSpec      ComponentsSpec     `json:"components,omitempty" yaml:"components,omitempty"`
+	LoggingSpec         LoggingSpec        `json:"logging,omitempty" yaml:"logging,omitempty"`
 }
 
 type SecretsSpec struct {
@@ -129,6 +145,11 @@ type HandlerSpec struct {
 	SelectorSpec SelectorSpec `json:"selector,omitempty" yaml:"selector,omitempty"`
 }
 
+// LogName returns the name of the handler that can be used in logging.
+func (h HandlerSpec) LogName() string {
+	return utils.ComponentLogName(h.Name, h.Type, h.Version)
+}
+
 type SelectorSpec struct {
 	Fields []SelectorField `json:"fields" yaml:"fields"`
 }
@@ -142,16 +163,37 @@ type TracingSpec struct {
 	SamplingRate string     `json:"samplingRate" yaml:"samplingRate"`
 	Stdout       bool       `json:"stdout" yaml:"stdout"`
 	Zipkin       ZipkinSpec `json:"zipkin" yaml:"zipkin"`
+	Otel         OtelSpec   `json:"otel" yaml:"otel"`
 }
 
-// ZipkinSpec defines Zipkin trace configurations.
+// ZipkinSpec defines Zipkin exporter configurations.
 type ZipkinSpec struct {
 	EndpointAddress string `json:"endpointAddress" yaml:"endpointAddress"`
 }
 
+// OtelSpec defines Otel exporter configurations.
+type OtelSpec struct {
+	Protocol        string `json:"protocol" yaml:"protocol"`
+	EndpointAddress string `json:"endpointAddress" yaml:"endpointAddress"`
+	IsSecure        bool   `json:"isSecure" yaml:"isSecure"`
+}
+
 // MetricSpec configuration for metrics.
 type MetricSpec struct {
-	Enabled bool `json:"enabled" yaml:"enabled"`
+	Enabled bool          `json:"enabled" yaml:"enabled"`
+	Rules   []MetricsRule `json:"rules" yaml:"rules"`
+}
+
+// MetricsRule defines configuration options for a metric.
+type MetricsRule struct {
+	Name   string        `json:"name" yaml:"name"`
+	Labels []MetricLabel `json:"labels" yaml:"labels"`
+}
+
+// MetricsLabel defines an object that allows to set regex expressions for a label.
+type MetricLabel struct {
+	Name  string            `json:"name" yaml:"name"`
+	Regex map[string]string `json:"regex" yaml:"regex"`
 }
 
 // AppPolicySpec defines the policy data structure for each app.
@@ -202,14 +244,46 @@ type FeatureSpec struct {
 	Enabled bool    `json:"enabled" yaml:"enabled"`
 }
 
+// ComponentsSpec describes the configuration for Dapr components
+type ComponentsSpec struct {
+	// Denylist of component types that cannot be instantiated
+	Deny []string `json:"deny,omitempty" yaml:"deny,omitempty"`
+}
+
+// LoggingSpec defines the configuration for logging.
+type LoggingSpec struct {
+	// Configure API logging.
+	APILogging APILoggingSpec `json:"apiLogging,omitempty" yaml:"apiLogging,omitempty"`
+}
+
+// APILoggingSpec defines the configuration for API logging.
+type APILoggingSpec struct {
+	// Default value for enabling API logging. Sidecars can always override this by setting `--enable-api-logging` to true or false explicitly.
+	// The default value is false.
+	Enabled bool `json:"enabled,omitempty" yaml:"enabled,omitempty"`
+	// When enabled, obfuscates the values of URLs in HTTP API logs, logging the route name rather than the full path being invoked, which could contain PII.
+	// Default: false.
+	// This option has no effect if API logging is disabled.
+	ObfuscateURLs bool `json:"obfuscateURLs" yaml:"obfuscateURLs"`
+	// If true, health checks are not reported in API logs. Default: false.
+	// This option has no effect if API logging is disabled.
+	OmitHealthChecks bool `json:"omitHealthChecks,omitempty" yaml:"omitHealthChecks,omitempty"`
+}
+
 // LoadDefaultConfiguration returns the default config.
 func LoadDefaultConfiguration() *Configuration {
 	return &Configuration{
 		Spec: ConfigurationSpec{
 			TracingSpec: TracingSpec{
 				SamplingRate: "",
+				Otel: OtelSpec{
+					IsSecure: true,
+				},
 			},
 			MetricSpec: MetricSpec{
+				Enabled: true,
+			},
+			MetricsSpec: MetricSpec{
 				Enabled: true,
 			},
 			AccessControlSpec: AccessControlSpec{
@@ -245,8 +319,7 @@ func LoadStandaloneConfiguration(config string) (*Configuration, string, error) 
 		return nil, string(b), err
 	}
 
-	noDefaultContentTypeValue = IsFeatureEnabled(conf.Spec.Features, NoDefaultContentType)
-
+	sortMetricsSpec(conf)
 	return conf, string(b), nil
 }
 
@@ -256,12 +329,12 @@ func LoadKubernetesConfiguration(config, namespace string, podName string, opera
 		Name:      config,
 		Namespace: namespace,
 		PodName:   podName,
-	}, grpc_retry.WithMax(operatorMaxRetries), grpc_retry.WithPerRetryTimeout(operatorCallTimeout))
+	}, grpcRetry.WithMax(operatorMaxRetries), grpcRetry.WithPerRetryTimeout(operatorCallTimeout))
 	if err != nil {
 		return nil, err
 	}
 	if resp.GetConfiguration() == nil {
-		return nil, errors.Errorf("configuration %s not found", config)
+		return nil, fmt.Errorf("configuration %s not found", config)
 	}
 	conf := LoadDefaultConfiguration()
 	err = json.Unmarshal(resp.GetConfiguration(), conf)
@@ -274,9 +347,19 @@ func LoadKubernetesConfiguration(config, namespace string, podName string, opera
 		return nil, err
 	}
 
-	noDefaultContentTypeValue = IsFeatureEnabled(conf.Spec.Features, NoDefaultContentType)
-
+	sortMetricsSpec(conf)
 	return conf, nil
+}
+
+// Apply .metrics if set. If not, retain .metric.
+func sortMetricsSpec(conf *Configuration) {
+	if !conf.Spec.MetricsSpec.Enabled {
+		conf.Spec.MetricSpec.Enabled = false
+	}
+
+	if len(conf.Spec.MetricsSpec.Rules) > 0 {
+		conf.Spec.MetricSpec.Rules = conf.Spec.MetricsSpec.Rules
+	}
 }
 
 // Validate the secrets configuration and sort to the allowed and denied lists if present.
@@ -286,12 +369,12 @@ func sortAndValidateSecretsConfiguration(conf *Configuration) error {
 	for _, scope := range scopes {
 		// validate scope
 		if set.Has(scope.StoreName) {
-			return errors.Errorf("%q storeName is repeated in secrets configuration", scope.StoreName)
+			return fmt.Errorf("%q storeName is repeated in secrets configuration", scope.StoreName)
 		}
 		if scope.DefaultAccess != "" &&
 			!strings.EqualFold(scope.DefaultAccess, AllowAccess) &&
 			!strings.EqualFold(scope.DefaultAccess, DenyAccess) {
-			return errors.Errorf("defaultAccess %q can be either allow or deny", scope.DefaultAccess)
+			return fmt.Errorf("defaultAccess %q can be either allow or deny", scope.DefaultAccess)
 		}
 		set.Insert(scope.StoreName)
 
@@ -334,23 +417,37 @@ func containsKey(s []string, key string) bool {
 	return index < len(s) && s[index] == key
 }
 
-func IsFeatureEnabled(features []FeatureSpec, target Feature) bool {
-	for _, feature := range features {
-		if feature.Name == target {
-			return feature.Enabled
+// LoadFeatures loads the list of enabled features, from the Configuration spec and from the buildinfo.
+func (c *Configuration) LoadFeatures() {
+	forced := buildinfo.Features()
+	c.featuresEnabled = make(map[Feature]struct{}, len(c.Spec.Features)+len(forced))
+	for _, feature := range c.Spec.Features {
+		if feature.Name == "" || !feature.Enabled {
+			continue
 		}
+		c.featuresEnabled[feature.Name] = struct{}{}
 	}
-	return false
+	for _, v := range forced {
+		if v == "" {
+			continue
+		}
+		c.featuresEnabled[Feature(v)] = struct{}{}
+	}
 }
 
-// GetNoDefaultContentType returns the value of the noDefaultContentType flag.
-// It requires the configuration to be loaded, otherwise it returns false.
-func GetNoDefaultContentType() bool {
-	return noDefaultContentTypeValue
+// IsFeatureEnabled returns true if a Feature (such as a preview) is enabled.
+func (c Configuration) IsFeatureEnabled(target Feature) (enabled bool) {
+	_, enabled = c.featuresEnabled[target]
+	return enabled
 }
 
-// SetNoDefaultContentType sets the value of noDefaultContentTypeValue.
-// This should only be used for testing.
-func SetNoDefaultContentType(val bool) {
-	noDefaultContentTypeValue = val
+// EnabledFeatures returns the list of features that have been enabled.
+func (c Configuration) EnabledFeatures() []string {
+	features := make([]string, len(c.featuresEnabled))
+	i := 0
+	for f := range c.featuresEnabled {
+		features[i] = string(f)
+		i++
+	}
+	return features[:i]
 }

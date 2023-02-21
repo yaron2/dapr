@@ -14,76 +14,73 @@ limitations under the License.
 package configuration
 
 import (
+	"fmt"
 	"strings"
-
-	"github.com/pkg/errors"
 
 	"github.com/dapr/components-contrib/configuration"
 	"github.com/dapr/dapr/pkg/components"
+	"github.com/dapr/kit/logger"
 )
 
-type Configuration struct {
-	Names         []string
-	FactoryMethod func() configuration.Store
-}
-
-// New creates a new Configuration.
-func New(name string, factoryMethod func() configuration.Store, aliases ...string) Configuration {
-	names := []string{name}
-	if len(aliases) > 0 {
-		names = append(names, aliases...)
-	}
-	return Configuration{
-		Names:         names,
-		FactoryMethod: factoryMethod,
-	}
-}
-
 // Registry is an interface for a component that returns registered configuration store implementations.
-type Registry interface {
-	Register(components ...Configuration)
-	Create(name, version string) (configuration.Store, error)
+type Registry struct {
+	Logger              logger.Logger
+	configurationStores map[string]func(logger.Logger) configuration.Store
 }
 
-type configurationStoreRegistry struct {
-	configurationStores map[string]func() configuration.Store
+// DefaultRegistry is the singleton with the registry.
+var DefaultRegistry *Registry
+
+func init() {
+	DefaultRegistry = NewRegistry()
 }
 
 // NewRegistry is used to create configuration store registry.
-func NewRegistry() Registry {
-	return &configurationStoreRegistry{
-		configurationStores: map[string]func() configuration.Store{},
+func NewRegistry() *Registry {
+	return &Registry{
+		configurationStores: map[string]func(logger.Logger) configuration.Store{},
 	}
 }
 
-// Register registers a new factory method that creates an instance of a ConfigurationStore.
-// The key is the name of the state store, eg. redis.
-func (s *configurationStoreRegistry) Register(components ...Configuration) {
-	for _, component := range components {
-		for _, name := range component.Names {
-			s.configurationStores[createFullName(name)] = component.FactoryMethod
-		}
+func (s *Registry) RegisterComponent(componentFactory func(logger.Logger) configuration.Store, names ...string) {
+	for _, name := range names {
+		s.configurationStores[createFullName(name)] = componentFactory
 	}
 }
 
-func (s *configurationStoreRegistry) Create(name, version string) (configuration.Store, error) {
-	if method, ok := s.getConfigurationStore(name, version); ok {
+func (s *Registry) Create(name, version, logName string) (configuration.Store, error) {
+	if method, ok := s.getConfigurationStore(name, version, logName); ok {
 		return method(), nil
 	}
-	return nil, errors.Errorf("couldn't find configuration store %s/%s", name, version)
+	return nil, fmt.Errorf("couldn't find configuration store %s/%s", name, version)
 }
 
-func (s *configurationStoreRegistry) getConfigurationStore(name, version string) (func() configuration.Store, bool) {
+func (s *Registry) getConfigurationStore(name, version, logName string) (func() configuration.Store, bool) {
 	nameLower := strings.ToLower(name)
 	versionLower := strings.ToLower(version)
 	configurationStoreFn, ok := s.configurationStores[nameLower+"/"+versionLower]
 	if ok {
-		return configurationStoreFn, true
+		return s.wrapFn(configurationStoreFn, logName), true
 	}
 	if components.IsInitialVersion(versionLower) {
 		configurationStoreFn, ok = s.configurationStores[nameLower]
+		if ok {
+			return s.wrapFn(configurationStoreFn, logName), true
+		}
 	}
-	return configurationStoreFn, ok
+	return nil, false
+}
+
+func (s *Registry) wrapFn(componentFactory func(logger.Logger) configuration.Store, logName string) func() configuration.Store {
+	return func() configuration.Store {
+		l := s.Logger
+		if logName != "" && l != nil {
+			l = l.WithFields(map[string]any{
+				"component": logName,
+			})
+		}
+		return componentFactory(l)
+	}
 }
 
 func createFullName(name string) string {

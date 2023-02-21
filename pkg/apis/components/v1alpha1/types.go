@@ -18,42 +18,54 @@ import (
 
 	v1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	"github.com/dapr/dapr/utils"
 )
 
-// +genclient
-// +genclient:noStatus
-// +kubebuilder:object:root=true
+//+genclient
+//+genclient:noStatus
+//+kubebuilder:object:root=true
 
 // Component describes an Dapr component type.
 type Component struct {
 	metav1.TypeMeta `json:",inline"`
-	// +optional
+	//+optional
 	metav1.ObjectMeta `json:"metadata,omitempty"`
-	// +optional
+	//+optional
 	Spec ComponentSpec `json:"spec,omitempty"`
-	// +optional
+	//+optional
 	Auth `json:"auth,omitempty"`
-	// +optional
+	//+optional
 	Scopes []string `json:"scopes,omitempty"`
+}
+
+// Kind returns the component kind.
+func (Component) Kind() string {
+	return "Component"
+}
+
+// LogName returns the name of the component that can be used in logging.
+func (c Component) LogName() string {
+	return utils.ComponentLogName(c.ObjectMeta.Name, c.Spec.Type, c.Spec.Version)
 }
 
 // ComponentSpec is the spec for a component.
 type ComponentSpec struct {
 	Type    string `json:"type"`
 	Version string `json:"version"`
-	// +optional
+	//+optional
 	IgnoreErrors bool           `json:"ignoreErrors"`
 	Metadata     []MetadataItem `json:"metadata"`
-	// +optional
+	//+optional
 	InitTimeout string `json:"initTimeout"`
 }
 
 // MetadataItem is a name/value pair for a metadata.
 type MetadataItem struct {
 	Name string `json:"name"`
-	// +optional
+	//+optional
 	Value DynamicValue `json:"value,omitempty"`
-	// +optional
+	//+optional
 	SecretKeyRef SecretKeyRef `json:"secretKeyRef,omitempty"`
 }
 
@@ -68,7 +80,7 @@ type Auth struct {
 	SecretStore string `json:"secretStore"`
 }
 
-// +kubebuilder:object:root=true
+//+kubebuilder:object:root=true
 
 // ComponentList is a list of Dapr components.
 type ComponentList struct {

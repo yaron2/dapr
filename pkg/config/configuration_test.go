@@ -14,10 +14,12 @@ limitations under the License.
 package config
 
 import (
+	"reflect"
 	"sort"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestLoadStandaloneConfiguration(t *testing.T) {
@@ -98,6 +100,28 @@ func TestMetricSpecForStandAlone(t *testing.T) {
 			config, _, err := LoadStandaloneConfiguration(tc.confFile)
 			assert.NoError(t, err)
 			assert.Equal(t, tc.metricEnabled, config.Spec.MetricSpec.Enabled)
+		})
+	}
+}
+
+func TestComponentsSpecForStandAlone(t *testing.T) {
+	testCases := []struct {
+		name           string
+		confFile       string
+		componentsDeny []string
+	}{
+		{
+			name:           "component deny list",
+			confFile:       "./testdata/components_config.yaml",
+			componentsDeny: []string{"foo.bar", "hello.world/v1"},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			config, _, err := LoadStandaloneConfiguration(tc.confFile)
+			assert.NoError(t, err)
+			assert.True(t, reflect.DeepEqual(tc.componentsDeny, config.Spec.ComponentsSpec.Deny))
 		})
 	}
 }
@@ -301,21 +325,24 @@ func TestContainsKey(t *testing.T) {
 }
 
 func TestFeatureEnabled(t *testing.T) {
-	t.Run("Test feature enabled is correct", func(t *testing.T) {
-		features := []FeatureSpec{
-			{
-				Name:    "testEnabled",
-				Enabled: true,
+	config := Configuration{
+		Spec: ConfigurationSpec{
+			Features: []FeatureSpec{
+				{
+					Name:    "testEnabled",
+					Enabled: true,
+				},
+				{
+					Name:    "testDisabled",
+					Enabled: false,
+				},
 			},
-			{
-				Name:    "testDisabled",
-				Enabled: false,
-			},
-		}
-		assert.True(t, IsFeatureEnabled(features, "testEnabled"))
-		assert.False(t, IsFeatureEnabled(features, "testDisabled"))
-		assert.False(t, IsFeatureEnabled(features, "testMissing"))
-	})
+		},
+	}
+	config.LoadFeatures()
+	assert.True(t, config.IsFeatureEnabled("testEnabled"))
+	assert.False(t, config.IsFeatureEnabled("testDisabled"))
+	assert.False(t, config.IsFeatureEnabled("testMissing"))
 }
 
 func TestFeatureSpecForStandAlone(t *testing.T) {
@@ -348,8 +375,9 @@ func TestFeatureSpecForStandAlone(t *testing.T) {
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			config, _, err := LoadStandaloneConfiguration(tc.confFile)
-			assert.NoError(t, err)
-			assert.Equal(t, tc.featureEnabled, IsFeatureEnabled(config.Spec.Features, tc.featureName))
+			require.NoError(t, err)
+			config.LoadFeatures()
+			assert.Equal(t, tc.featureEnabled, config.IsFeatureEnabled(tc.featureName))
 		})
 	}
 }
@@ -357,9 +385,33 @@ func TestFeatureSpecForStandAlone(t *testing.T) {
 func TestMTLSSpecForStandAlone(t *testing.T) {
 	t.Run("test mtls spec config", func(t *testing.T) {
 		config, _, err := LoadStandaloneConfiguration("./testdata/mtls_config.yaml")
-		assert.NoError(t, err)
+		require.NoError(t, err)
 		assert.True(t, config.Spec.MTLSSpec.Enabled)
 		assert.Equal(t, "25s", config.Spec.MTLSSpec.WorkloadCertTTL)
 		assert.Equal(t, "1h", config.Spec.MTLSSpec.AllowedClockSkew)
+	})
+}
+
+func TestSortMetrics(t *testing.T) {
+	t.Run("metrics overrides metric", func(t *testing.T) {
+		config := &Configuration{
+			Spec: ConfigurationSpec{
+				MetricSpec: MetricSpec{
+					Enabled: true,
+					Rules: []MetricsRule{
+						{
+							Name: "rule",
+						},
+					},
+				},
+				MetricsSpec: MetricSpec{
+					Enabled: false,
+				},
+			},
+		}
+
+		sortMetricsSpec(config)
+		assert.False(t, config.Spec.MetricSpec.Enabled)
+		assert.Equal(t, "rule", config.Spec.MetricSpec.Rules[0].Name)
 	})
 }

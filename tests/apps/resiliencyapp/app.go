@@ -18,9 +18,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
 	"net/http"
+	"os"
+	"strconv"
 	"time"
 
 	commonv1pb "github.com/dapr/dapr/pkg/proto/common/v1"
@@ -29,19 +30,27 @@ import (
 
 	"github.com/gorilla/mux"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 	pb "google.golang.org/grpc/examples/helloworld/helloworld"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/protobuf/types/known/anypb"
 )
 
-const (
-	appPort = 3000
+var (
+	appPort      = 3000
+	daprHttpPort = 3500
+	daprGrpcPort = 50001
+
+	daprClient   runtimev1pb.DaprClient
+	callTracking map[string][]CallRecord
+	httpClient   = utils.NewHTTPClient()
 )
 
 type FailureMessage struct {
 	ID              string         `json:"id"`
 	MaxFailureCount *int           `json:"maxFailureCount,omitempty"`
 	Timeout         *time.Duration `json:"timeout,omitempty"`
+	ResponseCode    *int           `json:"responseCode,omitempty"`
 }
 
 type CallRecord struct {
@@ -55,12 +64,20 @@ type PubsubResponse struct {
 	Message string `json:"message,omitempty"`
 }
 
-var (
-	daprClient   runtimev1pb.DaprClient
-	callTracking map[string][]CallRecord
-)
-
-var httpClient = utils.NewHTTPClient()
+func init() {
+	p := os.Getenv("DAPR_HTTP_PORT")
+	if p != "" && p != "0" {
+		daprHttpPort, _ = strconv.Atoi(p)
+	}
+	p = os.Getenv("DAPR_GRPC_PORT")
+	if p != "" && p != "0" {
+		daprGrpcPort, _ = strconv.Atoi(p)
+	}
+	p = os.Getenv("PORT")
+	if p != "" && p != "0" {
+		appPort, _ = strconv.Atoi(p)
+	}
+}
 
 // Endpoint handling.
 func indexHandler(w http.ResponseWriter, r *http.Request) {
@@ -124,10 +141,11 @@ func resiliencyBindingHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	body, _ := io.ReadAll(r.Body)
 	var message FailureMessage
-	json.NewDecoder(r.Body).Decode(&message)
+	json.Unmarshal(body, &message)
 
-	log.Printf("Binding received message %+v\n", message)
+	log.Printf("Binding received message %s\n", string(body))
 
 	callCount := 0
 	if records, ok := callTracking[message.ID]; ok {
@@ -159,7 +177,7 @@ func resiliencyPubsubHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	defer r.Body.Close()
 
-	body, err := ioutil.ReadAll(r.Body)
+	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		w.WriteHeader(http.StatusOK)
 		json.NewEncoder(w).Encode(PubsubResponse{
@@ -177,7 +195,7 @@ func resiliencyPubsubHandler(w http.ResponseWriter, r *http.Request) {
 	rawDataBytes, _ := json.Marshal(rawData)
 	var message FailureMessage
 	json.Unmarshal(rawDataBytes, &message)
-	log.Printf("Pubsub received message %+v\n", message)
+	log.Printf("Pubsub received message %s\n", string(rawDataBytes))
 
 	callCount := 0
 	if records, ok := callTracking[message.ID]; ok {
@@ -204,10 +222,11 @@ func resiliencyPubsubHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func resiliencyServiceInvocationHandler(w http.ResponseWriter, r *http.Request) {
+	body, _ := io.ReadAll(r.Body)
 	var message FailureMessage
-	json.NewDecoder(r.Body).Decode(&message)
+	json.Unmarshal(body, &message)
 
-	log.Printf("Http invocation received message %+v\n", message)
+	log.Printf("HTTP invocation received message %s\n", string(body))
 
 	callCount := 0
 	if records, ok := callTracking[message.ID]; ok {
@@ -217,6 +236,10 @@ func resiliencyServiceInvocationHandler(w http.ResponseWriter, r *http.Request) 
 	log.Printf("Seen %s %d times.", message.ID, callCount)
 
 	callTracking[message.ID] = append(callTracking[message.ID], CallRecord{Count: callCount, TimeSeen: time.Now()})
+	if message.ResponseCode != nil {
+		w.WriteHeader(*message.ResponseCode)
+		return
+	}
 	if message.MaxFailureCount != nil && callCount < *message.MaxFailureCount {
 		if message.Timeout != nil {
 			// This request can still succeed if the resiliency policy timeout is longer than this sleep.
@@ -230,10 +253,11 @@ func resiliencyServiceInvocationHandler(w http.ResponseWriter, r *http.Request) 
 }
 
 func resiliencyActorMethodHandler(w http.ResponseWriter, r *http.Request) {
+	body, _ := io.ReadAll(r.Body)
 	var message FailureMessage
-	json.NewDecoder(r.Body).Decode(&message)
+	json.Unmarshal(body, &message)
 
-	log.Printf("Actor received message %+v\n", message)
+	log.Printf("Actor received message %s\n", string(body))
 
 	callCount := 0
 	if records, ok := callTracking[message.ID]; ok {
@@ -255,30 +279,6 @@ func resiliencyActorMethodHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	w.WriteHeader(http.StatusOK)
-}
-
-// App startup/endpoint setup.
-func initGRPCClient() {
-	url := fmt.Sprintf("localhost:%d", 50001)
-	log.Printf("Connecting to dapr using url %s", url)
-	var grpcConn *grpc.ClientConn
-	for retries := 10; retries > 0; retries-- {
-		var err error
-		grpcConn, err = grpc.Dial(url, grpc.WithInsecure())
-		if err == nil {
-			break
-		}
-
-		if retries == 0 {
-			log.Printf("Could not connect to dapr: %v", err)
-			log.Panic(err)
-		}
-
-		log.Printf("Could not connect to dapr: %v, retrying...", err)
-		time.Sleep(5 * time.Second)
-	}
-
-	daprClient = runtimev1pb.NewDaprClient(grpcConn)
 }
 
 func appRouter() *mux.Router {
@@ -317,10 +317,10 @@ func appRouter() *mux.Router {
 
 func main() {
 	callTracking = map[string][]CallRecord{}
-	initGRPCClient()
+	daprClient = utils.GetGRPCClient(daprGrpcPort)
 
 	log.Printf("Resiliency App - listening on http://localhost:%d", appPort)
-	utils.StartServer(appPort, appRouter, true)
+	utils.StartServer(appPort, appRouter, true, false)
 }
 
 // Test Functions.
@@ -419,8 +419,17 @@ func TestInvokeService(w http.ResponseWriter, r *http.Request) {
 	protocol := mux.Vars(r)["protocol"]
 	log.Printf("Invoking resiliency service with %s", protocol)
 
+	targetApp := r.URL.Query().Get("target_app")
+	targetMethod := r.URL.Query().Get("target_method")
+
 	if protocol == "http" {
-		url := "http://localhost:3500/v1.0/invoke/resiliencyapp/method/resiliencyInvocation"
+		if targetApp == "" {
+			targetApp = "resiliencyapp"
+		}
+		if targetMethod == "" {
+			targetMethod = "resiliencyInvocation"
+		}
+		url := fmt.Sprintf("http://localhost:%d/v1.0/invoke/%s/method/%s", daprHttpPort, targetApp, targetMethod)
 
 		req, _ := http.NewRequest("POST", url, r.Body)
 		defer r.Body.Close()
@@ -438,6 +447,13 @@ func TestInvokeService(w http.ResponseWriter, r *http.Request) {
 			w.Write(b)
 		}
 	} else if protocol == "grpc" {
+		if targetApp == "" {
+			targetApp = "resiliencyappgrpc"
+		}
+		if targetMethod == "" {
+			targetMethod = "grpcInvoke"
+		}
+
 		var message FailureMessage
 		err := json.NewDecoder(r.Body).Decode(&message)
 		if err != nil {
@@ -448,9 +464,9 @@ func TestInvokeService(w http.ResponseWriter, r *http.Request) {
 		b, _ := json.Marshal(message)
 
 		req := &runtimev1pb.InvokeServiceRequest{
-			Id: "resiliencyappgrpc",
+			Id: targetApp,
 			Message: &commonv1pb.InvokeRequest{
-				Method: "grpcInvoke",
+				Method: targetMethod,
 				Data: &anypb.Any{
 					Value: b,
 				},
@@ -475,7 +491,11 @@ func TestInvokeService(w http.ResponseWriter, r *http.Request) {
 		log.Printf("Proxying message: %+v", message)
 		b, _ := json.Marshal(message)
 
-		conn, err := grpc.Dial("localhost:50001", grpc.WithInsecure(), grpc.WithBlock())
+		conn, err := grpc.Dial(
+			fmt.Sprintf("localhost:%d", daprGrpcPort),
+			grpc.WithTransportCredentials(insecure.NewCredentials()),
+			grpc.WithBlock(),
+		)
 		if err != nil {
 			log.Fatalf("did not connect: %v", err)
 		}
@@ -500,7 +520,7 @@ func TestInvokeActorMethod(w http.ResponseWriter, r *http.Request) {
 
 	if protocol == "http" {
 		httpClient.Timeout = time.Minute
-		url := "http://localhost:3500/v1.0/actors/resiliencyActor/1/method/resiliencyMethod"
+		url := fmt.Sprintf("http://localhost:%d/v1.0/actors/resiliencyActor/1/method/resiliencyMethod", daprHttpPort)
 
 		req, _ := http.NewRequest("PUT", url, r.Body)
 		defer r.Body.Close()

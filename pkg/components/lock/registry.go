@@ -1,67 +1,71 @@
 package lock
 
 import (
+	"fmt"
 	"strings"
-
-	"github.com/pkg/errors"
 
 	"github.com/dapr/components-contrib/lock"
 	"github.com/dapr/dapr/pkg/components"
+	"github.com/dapr/kit/logger"
 )
 
-type Lock struct {
-	Name          string
-	FactoryMethod func() lock.Store
+type Registry struct {
+	Logger logger.Logger
+	stores map[string]func(logger.Logger) lock.Store
 }
 
-func New(name string, f func() lock.Store) Lock {
-	return Lock{
-		Name:          name,
-		FactoryMethod: f,
+// DefaultRegistry is the singleton with the registry.
+var DefaultRegistry *Registry
+
+func init() {
+	DefaultRegistry = NewRegistry()
+}
+
+func NewRegistry() *Registry {
+	return &Registry{
+		stores: make(map[string]func(logger.Logger) lock.Store),
 	}
 }
 
-type Registry interface {
-	Register(fs ...Lock)
-	Create(name, version string) (lock.Store, error)
-}
-
-type lockRegistry struct {
-	stores map[string]func() lock.Store
-}
-
-func NewRegistry() Registry {
-	return &lockRegistry{
-		stores: make(map[string]func() lock.Store),
+func (r *Registry) RegisterComponent(componentFactory func(logger.Logger) lock.Store, names ...string) {
+	for _, name := range names {
+		r.stores[createFullName(name)] = componentFactory
 	}
 }
 
-// Register registers a new factory method that creates an instance of a lock.Store.
-// The key is the name of the state store, eg. redis.
-func (r *lockRegistry) Register(fs ...Lock) {
-	for _, f := range fs {
-		r.stores[createFullName(f.Name)] = f.FactoryMethod
-	}
-}
-
-func (r *lockRegistry) Create(name, version string) (lock.Store, error) {
-	if method, ok := r.getStore(name, version); ok {
+func (r *Registry) Create(name, version, logName string) (lock.Store, error) {
+	if method, ok := r.getStore(name, version, logName); ok {
 		return method(), nil
 	}
-	return nil, errors.Errorf("couldn't find lock store %s/%s", name, version)
+	return nil, fmt.Errorf("couldn't find lock store %s/%s", name, version)
 }
 
-func (r *lockRegistry) getStore(name, version string) (func() lock.Store, bool) {
+func (r *Registry) getStore(name, version, logName string) (func() lock.Store, bool) {
 	nameLower := strings.ToLower(name)
 	versionLower := strings.ToLower(version)
 	factoryMethod, ok := r.stores[nameLower+"/"+versionLower]
 	if ok {
-		return factoryMethod, true
+		return r.wrapFn(factoryMethod, logName), true
 	}
 	if components.IsInitialVersion(versionLower) {
 		factoryMethod, ok = r.stores[nameLower]
+		if ok {
+			return r.wrapFn(factoryMethod, logName), true
+		}
 	}
-	return factoryMethod, ok
+	return nil, false
+}
+
+func (r *Registry) wrapFn(componentFactory func(logger.Logger) lock.Store, logName string) func() lock.Store {
+	return func() lock.Store {
+		l := r.Logger
+		if logName != "" && l != nil {
+			l = l.WithFields(map[string]any{
+				"component": logName,
+			})
+		}
+		return componentFactory(l)
+	}
 }
 
 func createFullName(name string) string {

@@ -11,24 +11,79 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+//nolint:nosnakecase
 package grpc
 
 import (
 	"context"
+	"sort"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"google.golang.org/grpc"
 
 	"github.com/dapr/dapr/pkg/config"
+	runtimev1pb "github.com/dapr/dapr/pkg/proto/runtime/v1"
 )
 
-func TestSetAPIEndpointsMiddlewareUnary(t *testing.T) {
-	h := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return nil, nil
+func TestEndpointCompleteness(t *testing.T) {
+	// Get the list of endpoints in the runtime
+	runtimeEndpoints := []string{}
+	prefix := "/" + runtimev1pb.Dapr_ServiceDesc.ServiceName + "/"
+	for _, m := range runtimev1pb.Dapr_ServiceDesc.Methods {
+		runtimeEndpoints = append(runtimeEndpoints, prefix+m.MethodName)
 	}
+	for _, m := range runtimev1pb.Dapr_ServiceDesc.Streams {
+		runtimeEndpoints = append(runtimeEndpoints, prefix+m.StreamName)
+	}
+	sort.Strings(runtimeEndpoints)
 
-	t.Run("state endpoints allowed", func(t *testing.T) {
+	// Get the list of endpoints in this package (regardless of group)
+	packageEndpoints := []string{}
+	for _, g := range endpoints {
+		packageEndpoints = append(packageEndpoints, g...)
+	}
+	sort.Strings(packageEndpoints)
+
+	assert.Equal(t, runtimeEndpoints, packageEndpoints, "the list of endpoints defined in this package does not match the endpoints defined in the %s gRPC service", runtimev1pb.Dapr_ServiceDesc.ServiceName)
+}
+
+func hUnary(ctx context.Context, req any) (any, error) {
+	return nil, nil
+}
+
+func hStream(srv any, stream grpc.ServerStream) error {
+	return nil
+}
+
+func testMiddleware(u grpc.UnaryServerInterceptor, s grpc.StreamServerInterceptor) func(t *testing.T, method string, expectErr bool) {
+	return func(t *testing.T, method string, expectErr bool) {
+		t.Helper()
+
+		_, err := u(nil, nil, &grpc.UnaryServerInfo{
+			FullMethod: method,
+		}, hUnary)
+		if expectErr {
+			assert.Error(t, err)
+			assert.ErrorContains(t, err, "Unimplemented")
+		} else {
+			assert.NoError(t, err)
+		}
+
+		err = s(nil, nil, &grpc.StreamServerInfo{
+			FullMethod: method,
+		}, hStream)
+		if expectErr {
+			assert.Error(t, err)
+			assert.ErrorContains(t, err, "Unimplemented")
+		} else {
+			assert.NoError(t, err)
+		}
+	}
+}
+
+func TestSetAPIEndpointsMiddleware(t *testing.T) {
+	t.Run("state.v1 endpoints allowed", func(t *testing.T) {
 		a := []config.APIAccessRule{
 			{
 				Name:     "state",
@@ -37,22 +92,40 @@ func TestSetAPIEndpointsMiddlewareUnary(t *testing.T) {
 			},
 		}
 
-		f := setAPIEndpointsMiddlewareUnary(a)
+		tm := testMiddleware(setAPIEndpointsMiddlewares(a))
 
 		for _, e := range endpoints["state.v1"] {
-			_, err := f(nil, nil, &grpc.UnaryServerInfo{
-				FullMethod: e,
-			}, h)
-			assert.NoError(t, err)
+			tm(t, e, false)
 		}
 
 		for k, v := range endpoints {
 			if k != "state.v1" {
 				for _, e := range v {
-					_, err := f(nil, nil, &grpc.UnaryServerInfo{
-						FullMethod: e,
-					}, h)
-					assert.Error(t, err)
+					tm(t, e, true)
+				}
+			}
+		}
+	})
+
+	t.Run("state.v1alpha1 endpoints allowed", func(t *testing.T) {
+		a := []config.APIAccessRule{
+			{
+				Name:     "state",
+				Version:  "v1alpha1",
+				Protocol: "grpc",
+			},
+		}
+
+		tm := testMiddleware(setAPIEndpointsMiddlewares(a))
+
+		for _, e := range endpoints["state.v1alpha1"] {
+			tm(t, e, false)
+		}
+
+		for k, v := range endpoints {
+			if k != "state.v1alpha1" {
+				for _, e := range v {
+					tm(t, e, true)
 				}
 			}
 		}
@@ -67,22 +140,16 @@ func TestSetAPIEndpointsMiddlewareUnary(t *testing.T) {
 			},
 		}
 
-		f := setAPIEndpointsMiddlewareUnary(a)
+		tm := testMiddleware(setAPIEndpointsMiddlewares(a))
 
 		for _, e := range endpoints["publish.v1"] {
-			_, err := f(nil, nil, &grpc.UnaryServerInfo{
-				FullMethod: e,
-			}, h)
-			assert.NoError(t, err)
+			tm(t, e, false)
 		}
 
 		for k, v := range endpoints {
 			if k != "publish.v1" {
 				for _, e := range v {
-					_, err := f(nil, nil, &grpc.UnaryServerInfo{
-						FullMethod: e,
-					}, h)
-					assert.Error(t, err)
+					tm(t, e, true)
 				}
 			}
 		}
@@ -97,22 +164,16 @@ func TestSetAPIEndpointsMiddlewareUnary(t *testing.T) {
 			},
 		}
 
-		f := setAPIEndpointsMiddlewareUnary(a)
+		tm := testMiddleware(setAPIEndpointsMiddlewares(a))
 
 		for _, e := range endpoints["actors.v1"] {
-			_, err := f(nil, nil, &grpc.UnaryServerInfo{
-				FullMethod: e,
-			}, h)
-			assert.NoError(t, err)
+			tm(t, e, false)
 		}
 
 		for k, v := range endpoints {
 			if k != "actors.v1" {
 				for _, e := range v {
-					_, err := f(nil, nil, &grpc.UnaryServerInfo{
-						FullMethod: e,
-					}, h)
-					assert.Error(t, err)
+					tm(t, e, true)
 				}
 			}
 		}
@@ -127,22 +188,16 @@ func TestSetAPIEndpointsMiddlewareUnary(t *testing.T) {
 			},
 		}
 
-		f := setAPIEndpointsMiddlewareUnary(a)
+		tm := testMiddleware(setAPIEndpointsMiddlewares(a))
 
 		for _, e := range endpoints["bindings.v1"] {
-			_, err := f(nil, nil, &grpc.UnaryServerInfo{
-				FullMethod: e,
-			}, h)
-			assert.NoError(t, err)
+			tm(t, e, false)
 		}
 
 		for k, v := range endpoints {
 			if k != "bindings.v1" {
 				for _, e := range v {
-					_, err := f(nil, nil, &grpc.UnaryServerInfo{
-						FullMethod: e,
-					}, h)
-					assert.Error(t, err)
+					tm(t, e, true)
 				}
 			}
 		}
@@ -157,22 +212,16 @@ func TestSetAPIEndpointsMiddlewareUnary(t *testing.T) {
 			},
 		}
 
-		f := setAPIEndpointsMiddlewareUnary(a)
+		tm := testMiddleware(setAPIEndpointsMiddlewares(a))
 
 		for _, e := range endpoints["secrets.v1"] {
-			_, err := f(nil, nil, &grpc.UnaryServerInfo{
-				FullMethod: e,
-			}, h)
-			assert.NoError(t, err)
+			tm(t, e, false)
 		}
 
 		for k, v := range endpoints {
 			if k != "secrets.v1" {
 				for _, e := range v {
-					_, err := f(nil, nil, &grpc.UnaryServerInfo{
-						FullMethod: e,
-					}, h)
-					assert.Error(t, err)
+					tm(t, e, true)
 				}
 			}
 		}
@@ -187,22 +236,16 @@ func TestSetAPIEndpointsMiddlewareUnary(t *testing.T) {
 			},
 		}
 
-		f := setAPIEndpointsMiddlewareUnary(a)
+		tm := testMiddleware(setAPIEndpointsMiddlewares(a))
 
 		for _, e := range endpoints["metadata.v1"] {
-			_, err := f(nil, nil, &grpc.UnaryServerInfo{
-				FullMethod: e,
-			}, h)
-			assert.NoError(t, err)
+			tm(t, e, false)
 		}
 
 		for k, v := range endpoints {
 			if k != "metadata.v1" {
 				for _, e := range v {
-					_, err := f(nil, nil, &grpc.UnaryServerInfo{
-						FullMethod: e,
-					}, h)
-					assert.Error(t, err)
+					tm(t, e, true)
 				}
 			}
 		}
@@ -217,22 +260,16 @@ func TestSetAPIEndpointsMiddlewareUnary(t *testing.T) {
 			},
 		}
 
-		f := setAPIEndpointsMiddlewareUnary(a)
+		tm := testMiddleware(setAPIEndpointsMiddlewares(a))
 
 		for _, e := range endpoints["shutdown.v1"] {
-			_, err := f(nil, nil, &grpc.UnaryServerInfo{
-				FullMethod: e,
-			}, h)
-			assert.NoError(t, err)
+			tm(t, e, false)
 		}
 
 		for k, v := range endpoints {
 			if k != "shutdown.v1" {
 				for _, e := range v {
-					_, err := f(nil, nil, &grpc.UnaryServerInfo{
-						FullMethod: e,
-					}, h)
-					assert.Error(t, err)
+					tm(t, e, true)
 				}
 			}
 		}
@@ -247,48 +284,28 @@ func TestSetAPIEndpointsMiddlewareUnary(t *testing.T) {
 			},
 		}
 
-		f := setAPIEndpointsMiddlewareUnary(a)
+		tm := testMiddleware(setAPIEndpointsMiddlewares(a))
 
 		for _, e := range endpoints["invoke.v1"] {
-			_, err := f(nil, nil, &grpc.UnaryServerInfo{
-				FullMethod: e,
-			}, h)
-			assert.NoError(t, err)
+			tm(t, e, false)
 		}
 
 		for k, v := range endpoints {
 			if k != "invoke.v1" {
 				for _, e := range v {
-					_, err := f(nil, nil, &grpc.UnaryServerInfo{
-						FullMethod: e,
-					}, h)
-					assert.Error(t, err)
+					tm(t, e, true)
 				}
 			}
 		}
 	})
 
-	t.Run("no rules, all endpoints are allowed", func(t *testing.T) {
-		f := setAPIEndpointsMiddlewareUnary(nil)
-
-		for _, e := range endpoints["invoke.v1"] {
-			_, err := f(nil, nil, &grpc.UnaryServerInfo{
-				FullMethod: e,
-			}, h)
-			assert.NoError(t, err)
-		}
-
-		for _, v := range endpoints {
-			for _, e := range v {
-				_, err := f(nil, nil, &grpc.UnaryServerInfo{
-					FullMethod: e,
-				}, h)
-				assert.NoError(t, err)
-			}
-		}
+	t.Run("no rules, middlewares are nil", func(t *testing.T) {
+		u, s := setAPIEndpointsMiddlewares(nil)
+		assert.Nil(t, u)
+		assert.Nil(t, s)
 	})
 
-	t.Run("protocol mismatch, rule not applied", func(t *testing.T) {
+	t.Run("protocol mismatch, middlewares are nil", func(t *testing.T) {
 		a := []config.APIAccessRule{
 			{
 				Name:     "state",
@@ -297,15 +314,8 @@ func TestSetAPIEndpointsMiddlewareUnary(t *testing.T) {
 			},
 		}
 
-		f := setAPIEndpointsMiddlewareUnary(a)
-
-		for _, v := range endpoints {
-			for _, e := range v {
-				_, err := f(nil, nil, &grpc.UnaryServerInfo{
-					FullMethod: e,
-				}, h)
-				assert.NoError(t, err)
-			}
-		}
+		u, s := setAPIEndpointsMiddlewares(a)
+		assert.Nil(t, u)
+		assert.Nil(t, s)
 	})
 }

@@ -18,6 +18,8 @@ import (
 	"log"
 	"os"
 
+	corev1 "k8s.io/api/core/v1"
+
 	configurationv1alpha1 "github.com/dapr/dapr/pkg/apis/configuration/v1alpha1"
 	kube "github.com/dapr/dapr/tests/platforms/kubernetes"
 )
@@ -30,13 +32,19 @@ type runnable interface {
 	Run() int
 }
 
-// PlatformInterface defines the testing platform for test runner.
-type PlatformInterface interface {
-	setup() error
-	tearDown() error
-	addComponents(comps []kube.ComponentDescription) error
-	addApps(apps []kube.AppDescription) error
+type LoadTester interface {
+	Run(platform PlatformInterface) error
+}
 
+// PlatformInterface defines the testing platform for test runner.
+//
+//nolint:interfacebloat
+type PlatformInterface interface {
+	Setup() error
+	TearDown() error
+
+	AddComponents(comps []kube.ComponentDescription) error
+	AddApps(apps []kube.AppDescription) error
 	AcquireAppExternalURL(name string) string
 	GetAppHostDetails(name string) (string, string, error)
 	Restart(name string) error
@@ -47,6 +55,8 @@ type PlatformInterface interface {
 	GetSidecarUsage(appName string) (*AppUsage, error)
 	GetTotalRestarts(appname string) (int, error)
 	GetConfiguration(name string) (*configurationv1alpha1.Configuration, error)
+	GetService(name string) (*corev1.Service, error)
+	LoadTest(loadtester LoadTester) error
 }
 
 // AppUsage holds the CPU and Memory information for the application.
@@ -93,10 +103,10 @@ func (tr *TestRunner) Start(m runnable) int {
 
 	// Setup testing platform
 	log.Println("Running setup...")
-	err := tr.Platform.setup()
+	err := tr.Platform.Setup()
 	defer func() {
 		log.Println("Running teardown...")
-		tr.tearDown()
+		tr.TearDown()
 	}()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed Platform.setup(), %s", err.Error())
@@ -106,7 +116,7 @@ func (tr *TestRunner) Start(m runnable) int {
 	// Install components.
 	if tr.components != nil && len(tr.components) > 0 {
 		log.Println("Installing components...")
-		if err := tr.Platform.addComponents(tr.components); err != nil {
+		if err := tr.Platform.AddComponents(tr.components); err != nil {
 			fmt.Fprintf(os.Stderr, "Failed Platform.addComponents(), %s", err.Error())
 			return runnerFailExitCode
 		}
@@ -117,7 +127,7 @@ func (tr *TestRunner) Start(m runnable) int {
 	// other setup work.
 	if tr.initApps != nil && len(tr.initApps) > 0 {
 		log.Println("Installing init apps...")
-		if err := tr.Platform.addApps(tr.initApps); err != nil {
+		if err := tr.Platform.AddApps(tr.initApps); err != nil {
 			fmt.Fprintf(os.Stderr, "Failed Platform.addInitApps(), %s", err.Error())
 			return runnerFailExitCode
 		}
@@ -126,7 +136,7 @@ func (tr *TestRunner) Start(m runnable) int {
 	// Install test apps. These are the main apps that provide the actual testing.
 	if tr.testApps != nil && len(tr.testApps) > 0 {
 		log.Println("Installing test apps...")
-		if err := tr.Platform.addApps(tr.testApps); err != nil {
+		if err := tr.Platform.AddApps(tr.testApps); err != nil {
 			fmt.Fprintf(os.Stderr, "Failed Platform.addApps(), %s", err.Error())
 			return runnerFailExitCode
 		}
@@ -137,9 +147,9 @@ func (tr *TestRunner) Start(m runnable) int {
 	return m.Run()
 }
 
-func (tr *TestRunner) tearDown() {
+func (tr *TestRunner) TearDown() {
 	// Tearing down platform
-	tr.Platform.tearDown()
+	tr.Platform.TearDown()
 
 	// TODO: Add the resources which will be tearing down
 }
