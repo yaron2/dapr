@@ -14,10 +14,10 @@ limitations under the License.
 package components
 
 import (
-	"github.com/dapr/components-contrib/bindings/postgres"
-	bindingsLoader "github.com/dapr/dapr/pkg/components/bindings"
+	"github.com/dapr/components-contrib/state/postgresql"
+	stateLoader "github.com/dapr/dapr/pkg/components/state"
 )
 
 func init() {
-	bindingsLoader.DefaultRegistry.RegisterOutputBinding(postgres.NewPostgres, "postgres", "postgresql")
+	stateLoader.DefaultRegistry.RegisterComponent(postgresql.NewPostgreSQLStateStore, "postgres", "postgresql")
 }
